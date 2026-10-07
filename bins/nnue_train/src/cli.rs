@@ -230,8 +230,8 @@ pub(crate) struct Cli {
     pub(crate) output: PathBuf,
 
     /// Inference checkpoint format. `yaneuraou` is available only for a
-    /// LayerStack trained with `--bucket-mode kingrank9` and writes an SFNN
-    /// evaluation file directly.
+    /// LayerStack trained with `--bucket-mode kingrank9` or `gp5` (or `gpk` with the
+    /// gp5 boundaries 0.4,0.6,0.8,1.0) and writes an SFNN evaluation file directly.
     #[arg(long, value_enum, default_value_t = OutputFormatArg::Tatara, global = true)]
     pub(crate) output_format: OutputFormatArg,
 
@@ -1149,11 +1149,24 @@ pub(crate) struct LayerstackArgs {
     pub(crate) progress_coeff: Option<PathBuf>,
 
     /// Bucket assignment: `progresskpabs` uses the KP-absolute progress model;
+    /// `gp5` uses Cyfamate board progress and requires 5 buckets without progress-coeff.
+    /// `gpk` uses the same board progress split at `--gp-bounds`; the self-describing
+    /// form `gpk:<boundaries>` (as recorded in checkpoints and experiment logs, e.g.
+    /// `gpk:0.4,0.6,0.8,1.0`) is accepted without `--gp-bounds`.
     /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets. The
     /// deprecated spelling `progress8kpabs` is accepted as an alias of
     /// `progresskpabs` (the digit is not the bucket count; see `--num-buckets`).
     #[arg(long, default_value = "progresskpabs")]
     pub(crate) bucket_mode: String,
+
+    /// Board-progress boundaries for `--bucket-mode gpk`: comma-separated, strictly
+    /// increasing values in (0, 1.5], or `none` for a single bucket. A position goes to
+    /// the bucket equal to the number of boundaries not above its progress, so
+    /// `--num-buckets` must be the boundary count plus one (at most 8 boundaries).
+    /// `0.4,0.6,0.8,1.0` routes exactly like `gp5`. Resume and rescore compare the
+    /// boundaries recorded in the raw checkpoint and reject a different list.
+    #[arg(long)]
+    pub(crate) gp_bounds: Option<String>,
 
     /// Output dimension of the FT (feature transformer) per perspective. Must be
     /// a positive multiple of 128. The default value keeps the network
@@ -1181,7 +1194,8 @@ pub(crate) struct LayerstackArgs {
 
     /// LayerStack output bucket count. In progresskpabs mode, each position is
     /// routed to `min(N-1, floor(p * N))` and N must be in `[2, 9]`. In
-    /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
+    /// kingrank9 mode this value must be 9, in gp5 mode 5, and in gpk mode the
+    /// `--gp-bounds` count plus one (1 to 9). The upper bound is the fixed 9-register accumulator
     /// in the per-bucket weight backward kernels. The default 9 keeps the
     /// binning and weight-buffer shape identical to the standard layout and
     /// resume-compatible with existing checkpoints. The historical 8-bucket
@@ -1286,6 +1300,16 @@ pub(crate) struct LayerstackArgs {
     /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
+
+    /// Square normalisation of the threat features: `hm` (default) mirrors the
+    /// files when the perspective's king is on files 6-9, as the base
+    /// `halfka-hm-*` feature sets do; `off` keeps the raw files (perspective
+    /// rotation only), for pairing threat features with a non-mirrored base
+    /// feature set such as `halfka-merged`. `off` changes the feature hash and
+    /// the artifact carries a `ThreatMirror=off` token, so the two are never
+    /// loaded for each other. Requires a threat profile other than `off`.
+    #[arg(long = "threat-mirror", default_value = "hm")]
+    pub(crate) threat_mirror: String,
 
     /// effect bucket feature config. One of: off (default),
     /// 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed,

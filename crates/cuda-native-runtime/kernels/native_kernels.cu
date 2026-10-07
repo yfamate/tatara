@@ -1476,6 +1476,56 @@ extern "C" __global__ void ranger_lookahead_lerp_fp16_mirror(
     }
 }
 
+// Clamps weights[offset .. offset + n) to [min_weight, max_weight]. Used after the FT
+// optimizer step for the threat rows, which are exported as int8 at the FT scale.
+extern "C" __global__ void clamp_range(
+    float* weights,
+    unsigned long long,
+    unsigned int offset,
+    unsigned int n,
+    float min_weight,
+    float max_weight
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const unsigned int k = offset + i;
+    float p = weights[k];
+    if (p < min_weight) {
+        p = min_weight;
+    } else if (p > max_weight) {
+        p = max_weight;
+    }
+    weights[k] = p;
+}
+
+// clamp_range with the FP16 forward mirror kept in sync.
+extern "C" __global__ void clamp_range_mirror(
+    float* weights,
+    unsigned long long,
+    __half* mirror,
+    unsigned long long,
+    unsigned int offset,
+    unsigned int n,
+    float min_weight,
+    float max_weight
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const unsigned int k = offset + i;
+    float p = weights[k];
+    if (p < min_weight) {
+        p = min_weight;
+    } else if (p > max_weight) {
+        p = max_weight;
+    }
+    weights[k] = p;
+    mirror[k] = __float2half_rn(p);
+}
+
 extern "C" __global__ void radam_step(
     float* weights,
     unsigned long long,

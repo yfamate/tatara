@@ -9,6 +9,7 @@
 
 pub mod effect_bucket;
 pub mod feature_set;
+pub mod gp5;
 pub mod halfka_hm;
 pub mod kingrank9;
 pub mod progress_kpabs;
@@ -24,6 +25,10 @@ pub use effect_bucket::{
     map_effect_bucket_features_board, packed_is_bucketed,
 };
 pub use feature_set::{FeatureSet, FeatureSetSpec, FtFactorizeMode};
+pub use gp5::{
+    GP5_BOUNDS, GP5_NUM_BUCKETS, gp_bucket_board, gp_bucket_from_progress, gp5_bucket_board,
+    gp5_progress_board,
+};
 pub use halfka_hm::{
     FEATURE_HASH_HM_V2, HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, NUM_KING_BUCKETS, PIECE_INPUTS,
     SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, SHOGI_HALFKA_HM_NUM_FEATURES, ShogiHalfKA_hm,
@@ -31,7 +36,9 @@ pub use halfka_hm::{
 pub use kingrank9::{KINGRANK9_NUM_BUCKETS, kingrank9_bucket_board};
 pub use progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 pub use psqt_material::{material_cp, psqt_material_values};
-pub use threat::{THREAT_MAX_ACTIVE, ThreatClass, ThreatIndexer, threat_dimensions_of};
+pub use threat::{
+    THREAT_MAX_ACTIVE, ThreatClass, ThreatIndexer, ThreatMirror, threat_dimensions_of,
+};
 pub use threat_exclusion::ThreatProfile;
 pub use threat_symmetric::{
     RawThreatEdge, for_each_active_threat_edge, is_canonical_dead, is_necessarily_mutual,

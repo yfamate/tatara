@@ -10,7 +10,7 @@ use nnue_format::layerstack_weights::{
 use nnue_train::dataloader::BucketMode;
 use shogi_features::{
     EffectBucketConfig, FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs,
-    ThreatProfile, kingrank9_bucket_board,
+    ThreatMirror, ThreatProfile,
 };
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
@@ -24,9 +24,10 @@ struct Args {
     #[arg(long)]
     nnue_file: PathBuf,
 
-    /// Bucket assignment used when the net was trained: progresskpabs or
-    /// kingrank9. The deprecated spelling progress8kpabs is accepted as an
-    /// alias of progresskpabs.
+    /// Bucket assignment used when the net was trained: progresskpabs, kingrank9,
+    /// gp5, or gpk:<boundaries> (e.g. gpk:0.4,0.6,0.8,1.0, as recorded in the
+    /// training experiment log). The deprecated spelling progress8kpabs is accepted
+    /// as an alias of progresskpabs.
     #[arg(long, default_value = "progresskpabs")]
     bucket_mode: String,
 
@@ -34,12 +35,23 @@ struct Args {
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 
+    /// Input feature set the net was trained with. Quantised `.bin` files do not
+    /// record it, and the stored network hash rejects the wrong one. Cyfamate GP5
+    /// nets are `halfka-merged`.
+    #[arg(long, default_value = "halfka-hm-merged")]
+    feature_set: String,
+
     /// Quantised LayerStack output scale used to convert raw NNUE output to centipawns.
     #[arg(long, default_value_t = FV_SCALE)]
     fv_scale: i32,
 
     #[arg(long)]
     sfen: Vec<String>,
+
+    /// Text file with one position per line (same syntax as `--sfen`); lines are
+    /// appended after the `--sfen` values.
+    #[arg(long)]
+    sfen_file: Option<PathBuf>,
 
     #[arg(long)]
     debug: bool,
@@ -56,6 +68,23 @@ fn validate_mode_args(
     stored_num_buckets: usize,
 ) -> Result<Option<&Path>, String> {
     match mode {
+        BucketMode::Gp5 => {
+            if stored_num_buckets != 5 || progress_coeff.is_some() {
+                return Err("gp5 requires a five-bucket net and no --progress-coeff".into());
+            }
+            Ok(None)
+        }
+        BucketMode::Gpk(bounds) => {
+            if stored_num_buckets != bounds.num_buckets() || progress_coeff.is_some() {
+                return Err(format!(
+                    "--bucket-mode {} requires a {}-bucket net (file has {stored_num_buckets}) \
+                     and no --progress-coeff",
+                    mode.metadata_name(),
+                    bounds.num_buckets()
+                ));
+            }
+            Ok(None)
+        }
         BucketMode::ProgressKpAbs => progress_coeff
             .ok_or_else(|| "--progress-coeff is required with --bucket-mode progresskpabs".into())
             .map(Some),
@@ -77,29 +106,35 @@ fn validate_mode_args(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let (weights, spec) = load_layerstack(&args.nnue_file)?;
+    let feature_set = FeatureSet::from_canonical_name(&args.feature_set)
+        .ok_or_else(|| format!("unknown --feature-set {}", args.feature_set))?;
+    let (weights, spec) = load_layerstack(&args.nnue_file, feature_set)?;
     let (mode, warning) = BucketMode::parse_cli(&args.bucket_mode)?;
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
-    let progress = validate_mode_args(mode, args.progress_coeff.as_deref(), weights.num_buckets)?
+    let _progress = validate_mode_args(mode, args.progress_coeff.as_deref(), weights.num_buckets)?
         .map(|path| {
             ShogiProgressKPAbs::load_from_bin(path)
                 .map_err(|e| format!("failed to load progress coeff: {e}"))
         })
         .transpose()?;
-    let positions = if args.sfen.is_empty() {
-        vec!["startpos".to_string()]
-    } else {
-        args.sfen
-    };
+    let mut positions = args.sfen;
+    if let Some(path) = &args.sfen_file {
+        for line in std::fs::read_to_string(path)?.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                positions.push(line.to_string());
+            }
+        }
+    }
+    if positions.is_empty() {
+        positions.push("startpos".to_string());
+    }
 
     for pos in positions {
         let board = parse_position(&pos)?;
-        let bucket = progress.map_or_else(
-            || kingrank9_bucket_board(&board),
-            |progress| progress.bucket_board(&board, weights.num_buckets),
-        ) as usize;
+        let bucket = mode.bucket_board(&board, weights.num_buckets) as usize;
         let raw = forward_one_raw(&weights, spec, &board, bucket)?;
         let cp = raw / args.fv_scale;
         if args.debug {
@@ -112,10 +147,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn load_layerstack(
     path: &Path,
+    feature_set: FeatureSet,
 ) -> Result<(LayerStackWeights, FeatureSetSpec), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let meta = read_arch_meta(&bytes)?;
-    let mut spec = FeatureSet::HalfKaHmMerged.spec();
+    let mut spec = feature_set.spec();
     if let Some(effect_bucket_config) = meta.effect_bucket_config {
         spec = spec.with_effect_bucket_config(effect_bucket_config);
     }
@@ -124,6 +160,11 @@ fn load_layerstack(
             return Err("arch string contains both EffectBucket and Threat tokens".into());
         }
         spec = spec.with_threat_profile(threat_profile);
+        if meta.threat_mirror_off {
+            spec = spec.with_threat_mirror(ThreatMirror::Off);
+        }
+    } else if meta.threat_mirror_off {
+        return Err("arch string has ThreatMirror=off without a Threat token".into());
     }
     let mut cursor = Cursor::new(&bytes);
     let weights = LayerStackWeights::load_quantised(
@@ -140,6 +181,7 @@ fn load_layerstack(
 struct ArchMeta {
     effect_bucket_config: Option<EffectBucketConfig>,
     threat_profile: Option<ThreatProfile>,
+    threat_mirror_off: bool,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
@@ -177,6 +219,11 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     Ok(ArchMeta {
         effect_bucket_config: parse_effect_bucket_config(arch)?,
         threat_profile: parse_threat_profile(arch)?,
+        threat_mirror_off: match parse_token_str(arch, "ThreatMirror=") {
+            None => false,
+            Some("off") => true,
+            Some(other) => return Err(format!("unsupported ThreatMirror value `{other}`").into()),
+        },
         ft_out: parse_between(arch, "->", "x2]")?,
         l1_out: affine_outs.last().copied().unwrap_or(DEFAULT_L1_OUT),
         l2_out: affine_outs.get(1).copied().unwrap_or(DEFAULT_L2_OUT),

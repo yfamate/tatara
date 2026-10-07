@@ -28,7 +28,7 @@ use nnue_train::trainer::TrainingConfig;
 #[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
-use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatProfile};
+use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatMirror, ThreatProfile};
 #[cfg(any(feature = "gpu", test))]
 use shogi_features::{FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS};
 
@@ -307,11 +307,64 @@ pub(crate) fn validate_rescore_cli(
 pub(crate) fn validate_bucket_mode(
     args: &LayerstackArgs,
 ) -> Result<BucketMode, Box<dyn std::error::Error>> {
-    let (mode, warning) = BucketMode::parse_cli(&args.bucket_mode)?;
+    let (mode, warning) = match args.gp_bounds.as_deref() {
+        Some(list) if args.bucket_mode == BucketMode::GPK_NAME => {
+            let bounds = nnue_train::dataloader::GpBounds::parse_list(list)
+                .map_err(|reason| format!("--gp-bounds '{list}': {reason}"))?;
+            (BucketMode::Gpk(bounds), None)
+        }
+        Some(_) => {
+            return Err(format!(
+                "--gp-bounds is only used with --bucket-mode gpk (got --bucket-mode {}); \
+                 give the boundaries either there or in the gpk:<boundaries> form, not both",
+                args.bucket_mode
+            )
+            .into());
+        }
+        None if args.bucket_mode == BucketMode::GPK_NAME => {
+            return Err(
+                "--bucket-mode gpk requires --gp-bounds (comma-separated board-progress \
+                 boundaries such as 0.4,0.6,0.8,1.0, or none for a single bucket)"
+                    .into(),
+            );
+        }
+        None => BucketMode::parse_cli(&args.bucket_mode)?,
+    };
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
     match mode {
+        BucketMode::Gp5 => {
+            if args.num_buckets != 5 || args.progress_coeff.is_some() {
+                return Err("gp5 requires --num-buckets 5 and no --progress-coeff".into());
+            }
+            Ok(BucketMode::Gp5)
+        }
+        BucketMode::Gpk(bounds) => {
+            if args.progress_coeff.is_some() {
+                return Err(
+                    "--progress-coeff is not used with --bucket-mode gpk; remove it".into(),
+                );
+            }
+            if args.num_buckets != bounds.num_buckets() {
+                return Err(format!(
+                    "--bucket-mode {} defines {} bucket(s) ({} boundaries), but --num-buckets is {}",
+                    mode.metadata_name(),
+                    bounds.num_buckets(),
+                    bounds.as_slice().len(),
+                    args.num_buckets
+                )
+                .into());
+            }
+            if bounds.num_buckets() > MAX_LAYERSTACK_BUCKETS {
+                return Err(format!(
+                    "--bucket-mode gpk supports at most {MAX_LAYERSTACK_BUCKETS} buckets (got {})",
+                    bounds.num_buckets()
+                )
+                .into());
+            }
+            Ok(mode)
+        }
         BucketMode::ProgressKpAbs => {
             if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
                 return Err(format!(
@@ -345,14 +398,25 @@ pub(crate) fn validate_output_format(
     output_format: OutputFormatArg,
     bucket_mode: BucketMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
+    if output_format != OutputFormatArg::Yaneuraou
+        || matches!(bucket_mode, BucketMode::KingRank9)
+        || bucket_mode.is_gp5_routing()
     {
-        return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progresskpabs routing is not representable in YaneuraOu SFNN"
-                .into(),
-        );
+        return Ok(());
     }
-    Ok(())
+    if matches!(bucket_mode, BucketMode::Gpk(_)) {
+        return Err(format!(
+            "--output-format yaneuraou cannot record the partition of --bucket-mode {}; the \
+             engine file identifies only the gp5 boundaries 0.4,0.6,0.8,1.0 (and KingRank9). \
+             Use --output-format tatara",
+            bucket_mode.metadata_name()
+        )
+        .into());
+    }
+    Err(
+        "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9 or gp5; progresskpabs routing is not representable in YaneuraOu SFNN"
+            .into(),
+    )
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -513,6 +577,18 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             },
         )?),
     };
+    let threat_mirror = ThreatMirror::from_cli(&layerstack.threat_mirror).ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            format!(
+                "--threat-mirror '{}' is not a known mode (expected hm or off)",
+                layerstack.threat_mirror
+            )
+            .into()
+        },
+    )?;
+    if threat_mirror == ThreatMirror::Off && threat_profile.is_none() {
+        return Err("--threat-mirror off requires a --threat-profile other than off".into());
+    }
     let effect_bucket_config = parse_effect_bucket_config(&layerstack.effect_bucket_config)?;
     if cli.output_format == OutputFormatArg::Yaneuraou
         && (layerstack.psqt || threat_profile.is_some() || effect_bucket_config.is_some())
@@ -552,8 +628,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // .bin に書かれており初期化できる)。
     let feature_set = match (threat_profile, effect_bucket_config) {
         (Some(profile), None) => {
-            println!("[train] --threat-profile {profile} → FT input extended by threat dims");
-            feature_set.with_threat_profile(profile)
+            println!(
+                "[train] --threat-profile {profile} (mirror {}) → FT input extended by threat dims",
+                threat_mirror.name()
+            );
+            feature_set
+                .with_threat_profile(profile)
+                .with_threat_mirror(threat_mirror)
         }
         (None, Some(config)) => {
             println!(
@@ -591,6 +672,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let bucket_mode = validate_bucket_mode(layerstack)?;
     validate_output_format(cli.output_format, bucket_mode)?;
+    if cli.output_format == OutputFormatArg::Yaneuraou
+        && bucket_mode.is_gp5_routing()
+        && (feature_set != FeatureSet::HalfKaMerged.spec()
+            || layerstack.ft_out != 1024
+            || (layerstack.l1 != 8 && layerstack.l1 != 16)
+            || layerstack.l2 != 64)
+    {
+        return Err("Cyfamate GP5 export requires --feature-set halfka-merged, --ft-out 1024, --l1 8 (or 16 for the H15 prototype), --l2 64 and no extended features".into());
+    }
     // 学習は progress 係数未指定を全 bucket 4 に縮退させるが、リスコアで同じ縮退を
     // 許すと全行が誤 routing のラベルになる。rescore 経路のみ明示エラーにする。
     if cli.rescore_input.is_some()
@@ -1101,6 +1191,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 layerstack.num_buckets,
             ),
             threat_profile: layerstack.threat_profile.clone(),
+            threat_mirror: layerstack.threat_mirror.clone(),
             effect_bucket: layerstack.effect_bucket_config.clone(),
             ft_factorize,
             psqt: layerstack.psqt,
@@ -1860,8 +1951,9 @@ pub(crate) fn build_experiment_logger(
         num_buckets: Some(layerstack.num_buckets),
         optimizer: cli.optimizer.to_ascii_lowercase(),
         // CLI の生文字列 (非推奨 alias があり得る) ではなく、パース済み mode の
-        // canonical 名を記録する。experiment.json の bucket_mode は常に canonical。
-        bucket_mode: Some(bucket_mode.canonical_name().to_string()),
+        // canonical 名を記録する。experiment.json の bucket_mode は常に canonical
+        // (gpk は境界列込みの `gpk:<list>`)。
+        bucket_mode: Some(bucket_mode.metadata_name()),
         activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
         lr: finite_or_zero(cli.lr),

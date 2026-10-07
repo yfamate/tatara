@@ -486,6 +486,67 @@ pub fn radam_step(
     );
 }
 
+/// `weights[offset .. offset + n]` を `[min_w, max_w]` に clamp する。threat FT 行は
+/// int8 (FT scale) で export されるため、optimizer step の後に `|w| <= 127/QA` へ戻して
+/// 量子化誤差を学習中に見せる (dense 層の clamp と同じ方針)。
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn clamp_range(mut weights: DisjointSlice<f32>, offset: u32, n: u32, min_w: f32, max_w: f32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let idx = offset as usize + i.get();
+    if idx < weights.len() {
+        // SAFETY: bounds checked above; each thread writes its own cell.
+        let w = unsafe { weights.get_unchecked_mut(idx) };
+        let p = *w;
+        *w = if p < min_w {
+            min_w
+        } else if p > max_w {
+            max_w
+        } else {
+            p
+        };
+    }
+}
+
+/// [`clamp_range`] に FP16 forward mirror (`ft_w_h`) の同時更新を足した variant。
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn clamp_range_mirror(
+    mut weights: DisjointSlice<f32>,
+    mut mirror: DisjointSlice<f16>,
+    offset: u32,
+    n: u32,
+    min_w: f32,
+    max_w: f32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let idx = offset as usize + i.get();
+    if idx < weights.len() && idx < mirror.len() {
+        // SAFETY: bounds checked above; `mirror` is a separate allocation of the same length.
+        let w = unsafe { weights.get_unchecked_mut(idx) };
+        let p = *w;
+        let p = if p < min_w {
+            min_w
+        } else if p > max_w {
+            max_w
+        } else {
+            p
+        };
+        *w = p;
+        let mirror_ptr = mirror.as_mut_ptr();
+        // SAFETY: idx < mirror.len() checked above.
+        unsafe {
+            mirror_ptr.add(idx).write(p as f16);
+        }
+    }
+}
+
 /// `radam_step` の FP16 mirror 同時更新 variant (`--ft-fp16` の `ft_w` 専用)。
 ///
 /// forward は `ft_w` の FP16 mirror (`ft_w_h`) を読む。mirror を別 `cast_f32_to_f16`

@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use nnue_format::layerstack_weights::{LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION};
-use nnue_format::{LayerStackWeights, YANEURAOU_LAYER_STACKS, save_yaneuraou};
-use shogi_features::FeatureSet;
+use nnue_format::{
+    LayerStackWeights, YANEURAOU_LAYER_STACKS, save_yaneuraou, save_yaneuraou_cyfamate,
+};
+use shogi_features::{FeatureSet, FeatureSetSpec, ThreatMirror, ThreatProfile};
 
 /// LayerStack バケット数。YaneuraOu SFNN は KingRank9 (3x3) 固定で、変換対象も
 /// これに揃える。
@@ -38,6 +40,17 @@ struct Args {
     /// Quantised `.bin` files do not record their bucket routing mode.
     #[arg(long)]
     assume_kingrank9: bool,
+    /// Assert that the input was trained with Cyfamate GP5 routing.
+    #[arg(long, conflicts_with = "assume_kingrank9")]
+    assume_gp5: bool,
+    /// Write the Cyfamate GP-bucket research file: the comma-separated board-progress
+    /// boundaries the net was trained with (`--bucket-mode gpk:<list>`, `num_buckets - 1`
+    /// values, e.g. `0.15,0.3,0.45,0.6,0.75,0.9,1.05`). Accepts any FT width that is a
+    /// multiple of 128, fc_0 7+1 or 15+1, fc_1 64, and a `--threat-profile` net trained
+    /// with `--threat-mirror off`. `0.4,0.6,0.8,1` on a 1024/7+1/64 net writes the fixed
+    /// GP5 file.
+    #[arg(long, conflicts_with_all = ["assume_kingrank9", "assume_gp5"])]
+    cyfamate_gp_bounds: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,10 +58,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
-    require_kingrank9_assertion(args.assume_kingrank9)?;
+    if let Some(list) = &args.cyfamate_gp_bounds {
+        return convert_cyfamate(&args.input, &args.output, list);
+    }
+    if !args.assume_gp5 {
+        require_kingrank9_assertion(args.assume_kingrank9)?;
+    }
+    let buckets = if args.assume_gp5 { 5 } else { YO_LAYER_STACKS };
 
     let detect_input = File::open(&args.input)?;
-    let arch = detect_arch(&mut BufReader::new(detect_input))?;
+    let arch = detect_arch_buckets(&mut BufReader::new(detect_input), buckets)?;
 
     let input = File::open(&args.input)?;
     let mut reader = BufReader::new(input);
@@ -58,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arch.ft_out,
         arch.l1_out,
         arch.l2_out,
-        YO_LAYER_STACKS,
+        buckets,
     )?;
     reject_trailing_data(&mut reader)?;
 
@@ -67,6 +86,172 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     save_yaneuraou(&mut writer, &weights)?;
     writer.flush()?;
     Ok(())
+}
+
+/// tatara `.bin` → Cyfamate GP-bucket file. The tatara header is self-describing
+/// (feature set name, FT width, fc widths, threat tokens, bucket count); only the
+/// routing boundaries come from the command line.
+fn convert_cyfamate(
+    input: &PathBuf,
+    output: &PathBuf,
+    bounds_list: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bounds: Vec<f64> = bounds_list
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<f64>()
+                .map_err(|_| format!("`{s}` is not a number in --cyfamate-gp-bounds"))
+        })
+        .collect::<Result<_, _>>()?;
+    let bytes = std::fs::read(input)?;
+    let meta = read_tatara_meta(&bytes)?;
+    if meta.num_buckets != bounds.len() + 1 {
+        return Err(format!(
+            "{} boundaries define {} stacks, but the input has {} buckets",
+            bounds.len(),
+            bounds.len() + 1,
+            meta.num_buckets
+        )
+        .into());
+    }
+    let mut spec = meta.feature_set.spec();
+    if let Some(profile) = meta.threat_profile {
+        spec = spec.with_threat_profile(profile);
+        if meta.threat_mirror_off {
+            spec = spec.with_threat_mirror(ThreatMirror::Off);
+        }
+    }
+    let mut reader = std::io::Cursor::new(&bytes);
+    let weights = LayerStackWeights::load_quantised(
+        &mut reader,
+        spec,
+        meta.ft_out,
+        meta.l1_out,
+        meta.l2_out,
+        meta.num_buckets,
+    )?;
+    reject_trailing_data(&mut reader)?;
+    let out = File::create(output)?;
+    let mut writer = BufWriter::new(out);
+    save_yaneuraou_cyfamate(&mut writer, &weights, &bounds)?;
+    writer.flush()?;
+    println!(
+        "wrote {} ({} ft_out={} l1_out={} l2_out={} stacks={} threat={} bounds={bounds_list})",
+        output.display(),
+        spec.canonical_name(),
+        meta.ft_out,
+        meta.l1_out,
+        meta.l2_out,
+        meta.num_buckets,
+        match (meta.threat_profile, meta.threat_mirror_off) {
+            (Some(p), off) => format!("{p}/{}", if off { "off" } else { "hm" }),
+            (None, _) => "off".to_string(),
+        }
+    );
+    Ok(())
+}
+
+struct TataraMeta {
+    feature_set: FeatureSet,
+    threat_profile: Option<ThreatProfile>,
+    threat_mirror_off: bool,
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    num_buckets: usize,
+}
+
+/// Reads the tatara `.bin` header without rejecting threat tokens (PSQT / effect bucket
+/// stay unsupported).
+fn read_tatara_meta(bytes: &[u8]) -> io::Result<TataraMeta> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let version = read_u32(&mut reader)?;
+    if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
+        return invalid_input(format!("unknown tatara NNUE version: {version:#x}"));
+    }
+    let _network_hash = read_u32(&mut reader)?;
+    let arch_len = read_u32(&mut reader)? as usize;
+    if arch_len == 0 || arch_len > 16_384 {
+        return invalid_input(format!("invalid arch string length: {arch_len}"));
+    }
+    let mut arch_bytes = vec![0_u8; arch_len];
+    reader.read_exact(&mut arch_bytes)?;
+    let arch_str = std::str::from_utf8(&arch_bytes)
+        .map_err(|error| invalid_input_err(format!("arch string is not UTF-8: {error}")))?;
+    let num_buckets = if version == LEGACY_NNUE_VERSION_BUCKETS9 {
+        YO_LAYER_STACKS
+    } else {
+        read_u32(&mut reader)? as usize
+    };
+    for unsupported in ["PSQT=", "EffectBucket="] {
+        if arch_str.contains(unsupported) {
+            return invalid_input(format!(
+                "{} models are not representable in the Cyfamate GP format",
+                unsupported.trim_end_matches('=')
+            ));
+        }
+    }
+    let features = between(arch_str, "Features=", "(Friend)[")
+        .ok_or_else(|| invalid_input_err("arch string has no `Features=<name>(Friend)[` token".into()))?;
+    let feature_set = FeatureSet::ALL
+        .into_iter()
+        .find(|fs| fs.spec().arch_feature_name() == features)
+        .ok_or_else(|| invalid_input_err(format!("unknown feature set `{features}`")))?;
+    let ft_out = between(arch_str, "->", "x2")
+        .ok_or_else(|| invalid_input_err("arch string has no `-><ft>x2` token".into()))
+        .and_then(parse_usize)?;
+    let l2_out = between(arch_str, "AffineTransform[1<-", "]")
+        .ok_or_else(|| invalid_input_err("arch string has no output affine token".into()))
+        .and_then(parse_usize)?;
+    let l2_in = between(arch_str, "SqrClippedReLU[", "]")
+        .ok_or_else(|| invalid_input_err("arch string has no SqrClippedReLU token".into()))
+        .and_then(parse_usize)?;
+    if l2_in == 0 || l2_in % 2 != 0 {
+        return invalid_input(format!("unsupported L2 input dimension {l2_in}"));
+    }
+    let mut threat_dims: Option<usize> = None;
+    let mut threat_id: u32 = 0;
+    let mut threat_mirror_off = false;
+    for tok in arch_str.split(',') {
+        if let Some(v) = tok.strip_prefix("Threat=") {
+            threat_dims = Some(parse_usize(v)?);
+        } else if let Some(v) = tok.strip_prefix("ThreatProfile=") {
+            threat_id = parse_usize(v)? as u32;
+        } else if let Some(v) = tok.strip_prefix("ThreatMirror=") {
+            threat_mirror_off = v == "off";
+        }
+    }
+    let threat_profile = match threat_dims {
+        None => None,
+        Some(dims) => {
+            let profile = [
+                ThreatProfile::Full,
+                ThreatProfile::SameClass,
+                ThreatProfile::SameClassMajorPawn,
+                ThreatProfile::StepAttacker,
+                ThreatProfile::FullSymDedup,
+                ThreatProfile::CrossSide,
+            ]
+            .into_iter()
+            .find(|p| p.profile_id() == threat_id)
+            .ok_or_else(|| invalid_input_err(format!("unknown ThreatProfile id {threat_id}")))?;
+            if shogi_features::threat_dimensions_of(profile) != dims {
+                return invalid_input(format!("Threat dims {dims} disagree with profile {profile}"));
+            }
+            Some(profile)
+        }
+    };
+    let _ = FeatureSetSpec::ft_in; // spec consistency is enforced by load_quantised
+    Ok(TataraMeta {
+        feature_set,
+        threat_profile,
+        threat_mirror_off,
+        ft_out,
+        l1_out: l2_in / 2 + 1,
+        l2_out,
+        num_buckets,
+    })
 }
 
 fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
@@ -81,7 +266,15 @@ fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
 /// `.bin` header (version + network_hash + arch_str + num_buckets) を読み、変換
 /// 可能な SFNN アーキかを判定する。PSQT / threat / effect bucket / 非 9 bucket /
 /// 未知 feature は YaneuraOu SFNN に受け皿が無いため明示的に reject する。
+#[cfg(test)]
 fn detect_arch<R: Read>(reader: &mut R) -> io::Result<DetectedArch> {
+    detect_arch_buckets(reader, YO_LAYER_STACKS)
+}
+
+fn detect_arch_buckets<R: Read>(
+    reader: &mut R,
+    expected_buckets: usize,
+) -> io::Result<DetectedArch> {
     let version = read_u32(reader)?;
     if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
         return invalid_input(format!(
@@ -105,7 +298,7 @@ fn detect_arch<R: Read>(reader: &mut R) -> io::Result<DetectedArch> {
     } else {
         read_u32(reader)? as usize
     };
-    if num_buckets != YO_LAYER_STACKS {
+    if num_buckets != expected_buckets {
         return invalid_input(format!(
             "YaneuraOu SFNN requires {YO_LAYER_STACKS} LayerStacks (KingRank9), but the input has {num_buckets} buckets"
         ));
@@ -279,6 +472,7 @@ mod tests {
                 Some(ThreatArch {
                     dims: 128,
                     profile_id: 0,
+                    mirror_off: false,
                 }),
                 None,
             ),

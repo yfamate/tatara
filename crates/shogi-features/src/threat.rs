@@ -32,6 +32,50 @@ use crate::threat_symmetric::{RawThreatEdge, is_canonical_dead};
 /// ThreatClass の数 (King 除外、9 family)。
 pub const NUM_THREAT_CLASSES: usize = 9;
 
+/// Threat マス座標の HM mirror 方式。
+///
+/// [`ThreatMirror::Hm`] は視点 swap の後に玉筋 (6〜9 筋) で file を反転する rshogi
+/// 契約の座標。[`ThreatMirror::Off`] は視点 swap だけで file を反転しない座標で、
+/// mirror しない base feature (`halfka-merged` 等) と同じ盤座標で threat を学習する
+/// 場合に使う。index 空間 (`threat_dimensions`) はどちらも同じで、同じ edge が別の
+/// index に写るだけなので、artifact は feature hash / arch token で区別する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ThreatMirror {
+    /// 玉筋による半面 mirror (rshogi 契約)。
+    #[default]
+    Hm,
+    /// mirror しない (視点 swap のみ)。
+    Off,
+}
+
+impl ThreatMirror {
+    /// CLI 文字列から変換。未知の文字列は None。
+    pub fn from_cli(s: &str) -> Option<Self> {
+        match s {
+            "hm" => Some(Self::Hm),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// arch token / CLI で使う名前。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hm => "hm",
+            Self::Off => "off",
+        }
+    }
+
+    /// 玉位置から 1 視点の mirror flag を決める。`Off` は常に false。
+    #[inline]
+    pub(crate) fn flag(self, king_sq: Square, perspective: Color) -> bool {
+        match self {
+            Self::Hm => is_hm_mirror(king_sq, perspective),
+            Self::Off => false,
+        }
+    }
+}
+
 /// Threat 特徴量の per-position active 数の上限。行幅 `base(40) + THREAT_MAX_ACTIVE`
 /// を決める。DLSuisho 803M + aoba 103M 局面の Full profile 実測で total active の
 /// max は 145 (base 40 + threat ≤ 105)、分布は +1.5〜2 特徴ごとに count が半減する
@@ -681,6 +725,17 @@ impl ThreatIndexer {
         &self,
         board: &ShogiBoard,
         perspective: Color,
+        f: F,
+    ) {
+        self.for_each_active_threat_index_with_mirror(board, perspective, ThreatMirror::Hm, f);
+    }
+
+    /// [`Self::for_each_active_threat_index`] の mirror 方式指定版。
+    pub fn for_each_active_threat_index_with_mirror<F: FnMut(usize)>(
+        &self,
+        board: &ShogiBoard,
+        perspective: Color,
+        mirror: ThreatMirror,
         mut f: F,
     ) {
         let friend = perspective;
@@ -689,7 +744,7 @@ impl ThreatIndexer {
         if !king_sq.is_valid() || !enemy_king_sq.is_valid() {
             return;
         }
-        let hm = is_hm_mirror(king_sq, perspective);
+        let hm = mirror.flag(king_sq, perspective);
 
         let occ = Occupied::from_board(board);
 
@@ -769,8 +824,20 @@ impl ThreatIndexer {
 
     /// `perspective` 視点の active threat index を `Vec` で返す (test / 検証用)。
     pub fn active_threat_indices(&self, board: &ShogiBoard, perspective: Color) -> Vec<usize> {
+        self.active_threat_indices_with_mirror(board, perspective, ThreatMirror::Hm)
+    }
+
+    /// [`Self::active_threat_indices`] の mirror 方式指定版。
+    pub fn active_threat_indices_with_mirror(
+        &self,
+        board: &ShogiBoard,
+        perspective: Color,
+        mirror: ThreatMirror,
+    ) -> Vec<usize> {
         let mut out = Vec::new();
-        self.for_each_active_threat_index(board, perspective, |idx| out.push(idx));
+        self.for_each_active_threat_index_with_mirror(board, perspective, mirror, |idx| {
+            out.push(idx)
+        });
         out
     }
 
@@ -785,6 +852,18 @@ impl ThreatIndexer {
         board: &ShogiBoard,
         stm: Color,
         nstm: Color,
+        f: F,
+    ) {
+        self.for_each_active_threat_index_pair_with_mirror(board, stm, nstm, ThreatMirror::Hm, f);
+    }
+
+    /// [`Self::for_each_active_threat_index_pair`] の mirror 方式指定版。
+    pub fn for_each_active_threat_index_pair_with_mirror<F: FnMut(usize, usize)>(
+        &self,
+        board: &ShogiBoard,
+        stm: Color,
+        nstm: Color,
+        mirror: ThreatMirror,
         mut f: F,
     ) {
         let stm_king = board.king_square(stm);
@@ -792,8 +871,8 @@ impl ThreatIndexer {
         if !stm_king.is_valid() || !nstm_king.is_valid() {
             return;
         }
-        let stm_hm = is_hm_mirror(stm_king, stm);
-        let nstm_hm = is_hm_mirror(nstm_king, nstm);
+        let stm_hm = mirror.flag(stm_king, stm);
+        let nstm_hm = mirror.flag(nstm_king, nstm);
 
         let occ = Occupied::from_board(board);
 
@@ -1138,6 +1217,106 @@ mod tests {
             let per_perspective = dedup.active_threat_indices(&board, Color::Black).len();
             assert_eq!(count, per_perspective);
         }
+    }
+
+    /// startpos の step-attacker (profile 3) active index、非 mirror 座標、Black 視点、
+    /// 昇順。`canonical_startpos_step_attacker_indices_no_mirror` が固定する。
+    const STARTPOS_STEP_ATTACKER_NO_MIRROR: &[usize] = &[
+        1315, 1316, 1399, 1400, 5215, 5381, 10643, 10746, 19015, 19016, 19099, 19100, 24672,
+        25162, 31045, 31148,
+    ];
+
+    /// 盤全体を file 反転した局面を返す (玉位置も追従)。
+    fn file_mirrored(board: &ShogiBoard) -> ShogiBoard {
+        let mut out = ShogiBoard {
+            side_to_move: board.side_to_move,
+            black_king_sq: board.black_king_sq.mirror_file(),
+            white_king_sq: board.white_king_sq.mirror_file(),
+            ..Default::default()
+        };
+        for sq in 0..81u8 {
+            out.board[Square(sq).mirror_file().index()] = board.board[sq as usize];
+        }
+        out
+    }
+
+    /// 非 mirror 座標の golden: 視点の玉が 5 筋以内なら `Off` と `Hm` は同じ index を
+    /// 出し、6〜9 筋 (`is_hm_mirror` が立つ) なら `Hm(board) == Off(file_mirrored(board))`。
+    /// `mirrored_king_board` は Black 視点だけ mirror が立つ (White 玉 9一は White 視点で
+    /// 180 度回転後 1 筋) ので、両方の分岐を 1 局面で踏む。
+    #[test]
+    fn mirror_off_equals_hm_on_file_mirrored_board() {
+        for profile in [
+            ThreatProfile::Full,
+            ThreatProfile::StepAttacker,
+            ThreatProfile::CrossSide,
+        ] {
+            let indexer = ThreatIndexer::new(profile);
+            let start = startpos_board();
+            for perspective in [Color::Black, Color::White] {
+                let mut hm = indexer.active_threat_indices(&start, perspective);
+                let mut off =
+                    indexer.active_threat_indices_with_mirror(&start, perspective, ThreatMirror::Off);
+                hm.sort_unstable();
+                off.sort_unstable();
+                assert_eq!(hm, off, "{profile}: kings on file 4 → no mirror either way");
+            }
+            let board = mirrored_king_board();
+            let flipped = file_mirrored(&board);
+            let mut branches = [false, false];
+            for perspective in [Color::Black, Color::White] {
+                let mut hm = indexer.active_threat_indices(&board, perspective);
+                let mut off_raw =
+                    indexer.active_threat_indices_with_mirror(&board, perspective, ThreatMirror::Off);
+                let mut off_flipped = indexer.active_threat_indices_with_mirror(
+                    &flipped,
+                    perspective,
+                    ThreatMirror::Off,
+                );
+                hm.sort_unstable();
+                off_raw.sort_unstable();
+                off_flipped.sort_unstable();
+                assert!(!hm.is_empty(), "{profile}: test board has threat edges");
+                assert_eq!(hm.len(), off_raw.len(), "{profile}: same edge count");
+                if is_hm_mirror(board.king_square(perspective), perspective) {
+                    branches[0] = true;
+                    assert_eq!(hm, off_flipped, "{profile} {perspective:?}: Hm == Off on flipped");
+                    assert_ne!(hm, off_raw, "{profile} {perspective:?}: Off differs on raw board");
+                } else {
+                    branches[1] = true;
+                    assert_eq!(hm, off_raw, "{profile} {perspective:?}: no mirror → Hm == Off");
+                    assert_ne!(hm, off_flipped, "{profile} {perspective:?}: flipped differs");
+                }
+            }
+            assert_eq!(branches, [true, true], "both mirror branches exercised");
+        }
+    }
+
+    /// 非 mirror 座標での startpos golden (step-attacker)。startpos は両玉 5 筋なので
+    /// `Hm` と同値であり、値は `canonical_startpos_threat_indices` と同じ式から出る。
+    /// engine 側 (非 mirror HalfKA2 と組む indexer) の golden vector として固定する。
+    #[test]
+    fn canonical_startpos_step_attacker_indices_no_mirror() {
+        let board = startpos_board();
+        let indexer = ThreatIndexer::new(ThreatProfile::StepAttacker);
+        let mut black =
+            indexer.active_threat_indices_with_mirror(&board, Color::Black, ThreatMirror::Off);
+        black.sort_unstable();
+        let mut white =
+            indexer.active_threat_indices_with_mirror(&board, Color::White, ThreatMirror::Off);
+        white.sort_unstable();
+        assert_eq!(black, white, "symmetric startpos");
+        // step-attacker profile の index 空間 (33,408) に収まり、Full と同じ edge 数。
+        let full = ThreatIndexer::new(ThreatProfile::Full);
+        let full_black = full.active_threat_indices(&board, Color::Black);
+        // startpos の attacker は歩・桂・銀・金 (単発) と香・角・飛 (slider)。slider 分は落ちる。
+        assert!(black.len() < full_black.len());
+        assert!(black.iter().all(|&i| i < 33_408));
+        // 値そのものを固定 (再実装の回帰検出用)。
+        assert_eq!(
+            black, STARTPOS_STEP_ATTACKER_NO_MIRROR,
+            "startpos step-attacker (no mirror) golden; computed = {black:?}"
+        );
     }
 
     #[test]

@@ -791,6 +791,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-random"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "nnue-format",
+ "shogi-features",
+]
+
+[[package]]
 name = "net-to-yo"
 version = "0.1.0"
 dependencies = [
@@ -1347,6 +1356,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "threat-delta-survey"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "shogi-features",
+ "shogi-format",
 ]
 
 [[package]]

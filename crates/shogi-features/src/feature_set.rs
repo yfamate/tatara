@@ -21,7 +21,7 @@ use shogi_format::types::{Color, HAND_PIECE_TYPES, Square};
 use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 
 use crate::effect_bucket::{EffectBucketAttackCounts, EffectBucketConfig};
-use crate::threat::{THREAT_MAX_ACTIVE, ThreatIndexer};
+use crate::threat::{THREAT_MAX_ACTIVE, ThreatIndexer, ThreatMirror};
 use crate::threat_exclusion::ThreatProfile;
 
 // =============================================================================
@@ -117,6 +117,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_mirror: ThreatMirror::Hm,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaSplit => FeatureSetSpec {
@@ -131,6 +132,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_mirror: ThreatMirror::Hm,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
@@ -145,6 +147,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_mirror: ThreatMirror::Hm,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
@@ -159,6 +162,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_mirror: ThreatMirror::Hm,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
@@ -173,6 +177,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_mirror: ThreatMirror::Hm,
                 effect_bucket_config: None,
             },
         }
@@ -238,6 +243,10 @@ const fn threat_profile_hash(profile: ThreatProfile) -> u32 {
     }
 }
 
+/// threat mirror を切った spec の feature hash 定数。`feature_hash() = base ^ profile ^
+/// この値` で合成する (threat 有効時のみ)。
+const THREAT_MIRROR_OFF_HASH: u32 = fnv1a32("threat-mirror-off");
+
 /// effect bucket config ごとの feature hash 定数。`feature_hash() = base ^ この値` で
 /// 合成する。config は row の意味を変えるため load 時に hash / arch token の
 /// 両方で取り違えを弾く。
@@ -288,6 +297,10 @@ pub struct FeatureSetSpec {
     /// factorizer とは併用可 (fold/reduce/coalesce が threat pair ごとの仮想行を
     /// 追加で配線する)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
+    /// threat マス座標の mirror 方式。`threat_profile` が `None` のときは意味を持たず
+    /// hash / arch token にも現れない。`Off` は `feature_hash` を変え、artifact の
+    /// `ThreatMirror=off` token で区別する (rshogi 契約の `Hm` とは別 identity)。
+    threat_mirror: ThreatMirror,
     /// effect bucket で base index 全体を書き換える config。`None` で base と
     /// bit-identical。threat とは同時に使わない。
     effect_bucket_config: Option<EffectBucketConfig>,
@@ -329,6 +342,16 @@ impl FeatureSetSpec {
     /// 連結 threat profile (無効時 `None`)。
     pub const fn threat_profile(&self) -> Option<ThreatProfile> {
         self.threat_profile
+    }
+
+    /// threat マス座標の mirror 方式 (threat 無効時は既定の `Hm` を返すが意味を持たない)。
+    pub const fn threat_mirror(&self) -> ThreatMirror {
+        self.threat_mirror
+    }
+
+    /// threat が有効で、かつ mirror を切った spec か。
+    pub const fn threat_mirror_off(&self) -> bool {
+        self.threat_profile.is_some() && matches!(self.threat_mirror, ThreatMirror::Off)
     }
 
     /// effect bucket config (無効時 `None`)。
@@ -411,6 +434,18 @@ impl FeatureSetSpec {
         }
         FeatureSetSpec {
             threat_profile: Some(profile),
+            ..self
+        }
+    }
+
+    /// threat マス座標の mirror 方式を指定した spec を返す。threat profile が無い
+    /// spec には適用できない (panic)。`Off` は `feature_hash` を変える。
+    pub fn with_threat_mirror(self, mirror: ThreatMirror) -> Self {
+        if self.threat_profile.is_none() {
+            panic!("threat mirror mode needs a threat profile");
+        }
+        FeatureSetSpec {
+            threat_mirror: mirror,
             ..self
         }
     }
@@ -510,7 +545,13 @@ impl FeatureSetSpec {
     pub const fn feature_hash(&self) -> u32 {
         match (self.effect_bucket_config, self.threat_profile) {
             (Some(cfg), _) => self.feature_hash ^ effect_bucket_config_hash(cfg),
-            (None, Some(p)) => self.feature_hash ^ threat_profile_hash(p),
+            (None, Some(p)) => {
+                let h = self.feature_hash ^ threat_profile_hash(p);
+                match self.threat_mirror {
+                    ThreatMirror::Hm => h,
+                    ThreatMirror::Off => h ^ THREAT_MIRROR_OFF_HASH,
+                }
+            }
             (None, None) => self.feature_hash,
         }
     }
@@ -617,10 +658,11 @@ impl FeatureSetSpec {
         // 連結するので offset を足して emit する。
         if let Some(profile) = self.threat_profile {
             let base = self.base_ft_in();
-            ThreatIndexer::shared(profile).for_each_active_threat_index_pair(
+            ThreatIndexer::shared(profile).for_each_active_threat_index_pair_with_mirror(
                 board,
                 stm,
                 nstm,
+                self.threat_mirror,
                 |s, n| f(base + s, base + n),
             );
         }
@@ -790,10 +832,11 @@ impl FeatureSetSpec {
         let mut total = count;
         if let Some(profile) = self.threat_profile {
             let base = self.base_ft_in();
-            ThreatIndexer::shared(profile).for_each_active_threat_index_pair(
+            ThreatIndexer::shared(profile).for_each_active_threat_index_pair_with_mirror(
                 board,
                 stm,
                 nstm,
+                self.threat_mirror,
                 |s, n| {
                     if total < cap {
                         stm_out[total] = (base + s) as i32;
@@ -1330,6 +1373,84 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (35 通り)");
+    }
+
+    #[test]
+    fn threat_mirror_off_changes_hash_only_with_threat() {
+        // mirror off は threat 有効時だけ hash を変え、hm とも base とも distinct。
+        // threat 無効の spec では with_threat_mirror は呼べない (panic)。
+        let mut seen = Vec::new();
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            assert!(!base.threat_mirror_off());
+            for profile in ALL_PROFILES {
+                let hm = base.with_threat_profile(profile);
+                let off = hm.with_threat_mirror(ThreatMirror::Off);
+                assert_eq!(hm.threat_mirror(), ThreatMirror::Hm);
+                assert_eq!(off.threat_mirror(), ThreatMirror::Off);
+                assert!(off.threat_mirror_off());
+                assert_ne!(hm.feature_hash(), off.feature_hash());
+                assert_eq!(off.ft_in(), hm.ft_in());
+                assert_eq!(off.max_active(), hm.max_active());
+                assert_eq!(off.with_threat_mirror(ThreatMirror::Hm), hm);
+                seen.push(hm.feature_hash());
+                seen.push(off.feature_hash());
+            }
+        }
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "threat hm/off の合成 feature_hash に衝突がある");
+    }
+
+    #[test]
+    #[should_panic(expected = "threat mirror mode needs a threat profile")]
+    fn with_threat_mirror_requires_threat_profile() {
+        FeatureSet::HalfKaMerged
+            .spec()
+            .with_threat_mirror(ThreatMirror::Off);
+    }
+
+    #[test]
+    fn threat_mirror_off_emits_threat_in_raw_coordinates() {
+        // 玉が 5 筋 (file 4) の対称 startpos では hm と off の emit が一致し、
+        // 玉を 6〜9 筋へ置いた局面では threat 領域だけが変わる (base は不変)。
+        use shogi_format::types::{Piece, PieceType};
+        let profile = ThreatProfile::StepAttacker;
+        let hm = FeatureSet::HalfKaMerged.spec().with_threat_profile(profile);
+        let off = hm.with_threat_mirror(ThreatMirror::Off);
+
+        let board = startpos_for_overflow();
+        let mut a = Vec::new();
+        hm.map_features_board(&board, |s, n| a.push((s, n)));
+        let mut b = Vec::new();
+        off.map_features_board(&board, |s, n| b.push((s, n)));
+        assert_eq!(a, b, "両玉 5 筋では hm と off は一致");
+
+        let mut shifted = board.clone();
+        // 先手玉を 5九 → 8九 へ (file 7): hm 視点では file 反転が入る。
+        shifted.board[Square::new(4, 8).index()] = Piece::NONE;
+        shifted.board[Square::new(7, 8).index()] = Piece::new(Color::Black, PieceType::King);
+        shifted.black_king_sq = Square::new(7, 8);
+        let mut c = Vec::new();
+        hm.map_features_board(&shifted, |s, n| c.push((s, n)));
+        let mut d = Vec::new();
+        off.map_features_board(&shifted, |s, n| d.push((s, n)));
+        let base_n = {
+            let mut v = Vec::new();
+            FeatureSet::HalfKaMerged
+                .spec()
+                .map_features_board(&shifted, |s, n| v.push((s, n)));
+            v.len()
+        };
+        assert_eq!(&c[..base_n], &d[..base_n], "base 領域は mirror 方式に依らない");
+        assert_eq!(c.len(), d.len());
+        assert_ne!(&c[base_n..], &d[base_n..], "threat 領域は hm と off で別 index");
+        let base_ft_in = hm.base_ft_in();
+        for &(s, n) in &d[base_n..] {
+            assert!(s >= base_ft_in && s < off.ft_in());
+            assert!(n >= base_ft_in && n < off.ft_in());
+        }
     }
 
     #[test]

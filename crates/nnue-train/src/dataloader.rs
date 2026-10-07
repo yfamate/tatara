@@ -298,6 +298,102 @@ impl HcpeFileLoader {
     }
 }
 
+/// Boundary list of [`BucketMode::Gpk`]. A position whose board progress is `gp` goes to the
+/// bucket equal to the number of boundaries `b` with `b <= gp`, so `len` boundaries define
+/// `len + 1` buckets. Boundaries are finite, strictly increasing and inside the progress range
+/// `(0, PROGRESS_MAX]`, which keeps every bucket reachable in principle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpBounds {
+    values: [f64; GpBounds::MAX_LEN],
+    len: u8,
+}
+
+impl GpBounds {
+    /// The LayerStack per-bucket backward kernels hold at most nine buckets.
+    pub const MAX_LEN: usize = 8;
+    /// Upper clamp of `shogi_features::gp5_progress_board`.
+    pub const PROGRESS_MAX: f64 = 1.5;
+    /// Spelling of an empty boundary list (a single bucket).
+    pub const NONE: &'static str = "none";
+
+    /// Validates a boundary list.
+    pub fn new(values: &[f64]) -> Result<Self, String> {
+        if values.len() > Self::MAX_LEN {
+            return Err(format!(
+                "at most {} boundaries ({} buckets) are supported, got {}",
+                Self::MAX_LEN,
+                Self::MAX_LEN + 1,
+                values.len()
+            ));
+        }
+        for (i, &value) in values.iter().enumerate() {
+            if !value.is_finite() || value <= 0.0 || value > Self::PROGRESS_MAX {
+                return Err(format!(
+                    "boundary {value} is outside the board-progress range (0, {}]",
+                    Self::PROGRESS_MAX
+                ));
+            }
+            if i > 0 && value <= values[i - 1] {
+                return Err(format!(
+                    "boundaries must be strictly increasing ({} then {value})",
+                    values[i - 1]
+                ));
+            }
+        }
+        let mut stored = [0.0; Self::MAX_LEN];
+        stored[..values.len()].copy_from_slice(values);
+        Ok(Self {
+            values: stored,
+            len: values.len() as u8,
+        })
+    }
+
+    /// Parses a comma-separated list such as `0.4,0.6,0.8,1.0`, or `none` for no boundary.
+    pub fn parse_list(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text == Self::NONE {
+            return Self::new(&[]);
+        }
+        if text.is_empty() {
+            return Err(format!(
+                "empty boundary list (write '{}' for a single bucket)",
+                Self::NONE
+            ));
+        }
+        let values = text
+            .split(',')
+            .map(|item| {
+                let item = item.trim();
+                item.parse::<f64>()
+                    .map_err(|_| format!("'{item}' is not a number"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(&values)
+    }
+
+    pub fn as_slice(&self) -> &[f64] {
+        &self.values[..usize::from(self.len)]
+    }
+
+    /// Number of buckets the boundaries define (`len + 1`).
+    pub fn num_buckets(&self) -> usize {
+        usize::from(self.len) + 1
+    }
+
+    /// Canonical list text: shortest round-trip form of each value (`0.4,0.6,0.8,1.0`), or
+    /// `none`. Parsing it returns bit-identical boundaries.
+    pub fn list_string(&self) -> String {
+        if self.len == 0 {
+            return Self::NONE.to_string();
+        }
+        self.as_slice()
+            .iter()
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// LayerStack の position bucket 算出方式。
 #[derive(Clone, Copy, Debug, Default)]
 pub enum BucketMode {
@@ -306,6 +402,10 @@ pub enum BucketMode {
     ProgressKpAbs,
     /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
     KingRank9,
+    /// Board progress with fixed boundaries and five output stacks.
+    Gp5,
+    /// The same board progress as `Gp5`, split at a configurable boundary list.
+    Gpk(GpBounds),
 }
 
 impl BucketMode {
@@ -314,17 +414,44 @@ impl BucketMode {
     /// `--num-buckets` と format の格納値が持つ)。
     pub const LEGACY_PROGRESS_KPABS_NAME: &'static str = "progress8kpabs";
 
+    /// Base name of [`Self::Gpk`]. Its self-describing form is `gpk:<list>` with the
+    /// [`GpBounds::list_string`] list, e.g. `gpk:0.4,0.6,0.8,1.0`.
+    pub const GPK_NAME: &'static str = "gpk";
+
     /// checkpoint / experiment metadata に記録する canonical 名。
     /// 推論エンジン rshogi の `LayerStackBucketMode::as_str()` と同じ綴り。
+    /// `gpk` の境界はこの名前に含まれないため、記録には [`Self::metadata_name`] を使う。
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::ProgressKpAbs => "progresskpabs",
             Self::KingRank9 => "kingrank9",
+            Self::Gp5 => "gp5",
+            Self::Gpk(_) => Self::GPK_NAME,
         }
     }
 
-    /// bucket mode 名をパースする。canonical 名 (`progresskpabs` / `kingrank9`)
-    /// に加え、[`Self::LEGACY_PROGRESS_KPABS_NAME`] も受理する。返り値の bool は
+    /// Name written to raw checkpoints, experiment logs and rescore fingerprints. It equals
+    /// [`Self::canonical_name`] except for `gpk`, where it carries the boundary list
+    /// (`gpk:0.4,0.6,0.8,1.0`) so that resume and rescore can reject a different partition.
+    pub fn metadata_name(&self) -> String {
+        match self {
+            Self::Gpk(bounds) => format!("{}:{}", Self::GPK_NAME, bounds.list_string()),
+            _ => self.canonical_name().to_string(),
+        }
+    }
+
+    /// True when positions are routed exactly as the fixed `gp5` mode routes them.
+    pub fn is_gp5_routing(&self) -> bool {
+        match self {
+            Self::Gp5 => true,
+            Self::Gpk(bounds) => bounds.as_slice() == &shogi_features::GP5_BOUNDS[..],
+            _ => false,
+        }
+    }
+
+    /// bucket mode 名をパースする。canonical 名 (`progresskpabs` / `kingrank9` / `gp5`)、
+    /// `gpk:<list>` 形式 ([`Self::metadata_name`]) に加え、
+    /// [`Self::LEGACY_PROGRESS_KPABS_NAME`] も受理する。返り値の bool は
     /// legacy alias 経由で一致したかで、CLI 入力の呼び出し元が非推奨警告を出す
     /// 判断に使う (checkpoint header の読み戻しでは警告不要なので無視する)。
     pub fn parse(name: &str) -> Option<(Self, bool)> {
@@ -332,14 +459,29 @@ impl BucketMode {
             "progresskpabs" => Some((Self::ProgressKpAbs, false)),
             Self::LEGACY_PROGRESS_KPABS_NAME => Some((Self::ProgressKpAbs, true)),
             "kingrank9" => Some((Self::KingRank9, false)),
-            _ => None,
+            "gp5" => Some((Self::Gp5, false)),
+            _ => Self::parse_gpk(name)?.ok().map(|mode| (mode, false)),
         }
+    }
+
+    /// `None` when `name` is not of the form `gpk:<list>`; otherwise the parsed mode or the
+    /// reason the list is invalid.
+    fn parse_gpk(name: &str) -> Option<Result<Self, String>> {
+        let list = name
+            .strip_prefix(Self::GPK_NAME)
+            .and_then(|rest| rest.strip_prefix(':'))?;
+        Some(GpBounds::parse_list(list).map(Self::Gpk))
     }
 
     /// `--bucket-mode` CLI 入力向けのパース。全 CLI (trainer / eval_sfen 等) が
     /// 同一のエラー文・非推奨警告文を出すための単一パース点。alias 綴りのときは
     /// 呼び出し元がそのまま表示する警告文を `Some` で返す。
     pub fn parse_cli(name: &str) -> Result<(Self, Option<String>), String> {
+        if let Some(parsed) = Self::parse_gpk(name) {
+            return parsed
+                .map(|mode| (mode, None))
+                .map_err(|reason| format!("--bucket-mode '{name}': {reason}"));
+        }
         match Self::parse(name) {
             Some((mode, true)) => {
                 let warning = format!(
@@ -352,7 +494,8 @@ impl BucketMode {
             }
             Some((mode, false)) => Ok((mode, None)),
             None => Err(format!(
-                "--bucket-mode '{name}' is unknown (expected 'progresskpabs' or 'kingrank9')"
+                "--bucket-mode '{name}' is unknown (expected 'progresskpabs', 'kingrank9', \
+                 'gp5' or 'gpk:<boundaries>')"
             )),
         }
     }
@@ -363,6 +506,8 @@ impl BucketMode {
         match self {
             Self::ProgressKpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
             Self::KingRank9 => kingrank9_bucket_board(board),
+            Self::Gp5 => shogi_features::gp5_bucket_board(board),
+            Self::Gpk(bounds) => shogi_features::gp_bucket_board(board, bounds.as_slice()),
         }
     }
 }
@@ -1586,7 +1731,11 @@ mod tests {
         assert!(BucketMode::parse("progress9kpabs").is_none());
         assert!(BucketMode::parse("").is_none());
         // canonical 名は parse と round-trip する。
-        for mode in [BucketMode::ProgressKpAbs, BucketMode::KingRank9] {
+        for mode in [
+            BucketMode::ProgressKpAbs,
+            BucketMode::KingRank9,
+            BucketMode::Gp5,
+        ] {
             let (parsed, legacy) = BucketMode::parse(mode.canonical_name()).unwrap();
             assert_eq!(parsed.canonical_name(), mode.canonical_name());
             assert!(!legacy);
@@ -1596,7 +1745,11 @@ mod tests {
     #[test]
     fn bucket_mode_parse_cli_emits_deprecation_warning_only_for_alias() {
         // canonical 名は警告なしで通る。
-        for mode in [BucketMode::ProgressKpAbs, BucketMode::KingRank9] {
+        for mode in [
+            BucketMode::ProgressKpAbs,
+            BucketMode::KingRank9,
+            BucketMode::Gp5,
+        ] {
             let (parsed, warning) = BucketMode::parse_cli(mode.canonical_name()).unwrap();
             assert_eq!(parsed.canonical_name(), mode.canonical_name());
             assert!(warning.is_none(), "canonical name must not warn");
@@ -1622,6 +1775,196 @@ mod tests {
         assert!(err.contains("unknown"), "{err}");
         assert!(err.contains("progresskpabs"), "{err}");
         assert!(err.contains("kingrank9"), "{err}");
+        assert!(err.contains("gpk"), "{err}");
+    }
+
+    #[test]
+    fn gpk_metadata_name_round_trips_bit_exactly() {
+        let (mode, legacy) = BucketMode::parse("gpk:0.4,0.6,0.8,1").unwrap();
+        assert!(!legacy);
+        let BucketMode::Gpk(bounds) = mode else {
+            panic!("gpk list must parse as Gpk, got {mode:?}");
+        };
+        assert_eq!(bounds.as_slice(), &[0.4, 0.6, 0.8, 1.0]);
+        assert_eq!(bounds.num_buckets(), 5);
+        assert_eq!(mode.canonical_name(), "gpk");
+        assert_eq!(mode.metadata_name(), "gpk:0.4,0.6,0.8,1.0");
+        assert!(mode.is_gp5_routing());
+
+        for list in [
+            "none",
+            "0.5",
+            "0.1,0.2,0.30000000000000004,0.4,0.5,0.6,0.7,1.5",
+            "1e-7,1.4999999999999998",
+            " 0.45 , 0.7 ",
+        ] {
+            let bounds = GpBounds::parse_list(list).unwrap();
+            let name = BucketMode::Gpk(bounds).metadata_name();
+            assert!(name.len() <= 256, "{name}");
+            let (reparsed, _) = BucketMode::parse(&name).unwrap();
+            let BucketMode::Gpk(again) = reparsed else {
+                panic!("{name} must reparse as Gpk");
+            };
+            let bits = |b: &GpBounds| b.as_slice().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&again), bits(&bounds), "{name}");
+            assert_eq!(reparsed.metadata_name(), name);
+        }
+        let single = GpBounds::parse_list("none").unwrap();
+        assert_eq!(single.num_buckets(), 1);
+        assert_eq!(BucketMode::Gpk(single).metadata_name(), "gpk:none");
+        assert!(!BucketMode::Gpk(single).is_gp5_routing());
+        assert!(!BucketMode::Gpk(GpBounds::parse_list("0.4,0.6,0.8").unwrap()).is_gp5_routing());
+        assert!(BucketMode::Gp5.is_gp5_routing());
+        assert!(!BucketMode::KingRank9.is_gp5_routing());
+        for mode in [
+            BucketMode::ProgressKpAbs,
+            BucketMode::KingRank9,
+            BucketMode::Gp5,
+        ] {
+            assert_eq!(mode.metadata_name(), mode.canonical_name());
+        }
+    }
+
+    #[test]
+    fn gp_bounds_reject_invalid_lists() {
+        for (list, needle) in [
+            ("", "empty"),
+            ("0.6,0.4", "strictly increasing"),
+            ("0.4,0.4", "strictly increasing"),
+            ("0,0.5", "outside"),
+            ("-0.1", "outside"),
+            ("1.5000001", "outside"),
+            ("NaN", "outside"),
+            ("inf", "outside"),
+            ("0.4,,0.6", "not a number"),
+            ("0.4;0.6", "not a number"),
+            ("0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9", "at most 8"),
+        ] {
+            let err = GpBounds::parse_list(list).unwrap_err();
+            assert!(err.contains(needle), "{list}: {err}");
+            let cli = BucketMode::parse_cli(&format!("gpk:{list}")).unwrap_err();
+            assert!(cli.contains(needle), "{list}: {cli}");
+            assert!(BucketMode::parse(&format!("gpk:{list}")).is_none(), "{list}");
+        }
+        assert!(BucketMode::parse("gpk").is_none());
+        assert!(BucketMode::parse("gpk0.4").is_none());
+        assert_eq!(GpBounds::parse_list("1.5").unwrap().num_buckets(), 2);
+        assert_eq!(
+            GpBounds::parse_list("0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8")
+                .unwrap()
+                .num_buckets(),
+            9
+        );
+    }
+
+    /// `gpk` with the `gp5` boundaries routes every oracle position to the same bucket as
+    /// `gp5` and as the engine's full-scan reference.
+    #[test]
+    fn gpk_with_gp5_bounds_matches_gp5_on_oracle_positions() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("shogi-features/tests/fixtures/gp5_oracle.dat");
+        let text = std::fs::read_to_string(&fixture).expect("read gp5 oracle fixture");
+        let (gpk, _) = BucketMode::parse_cli("gpk:0.4,0.6,0.8,1.0").unwrap();
+        let (three, _) = BucketMode::parse_cli("gpk:0.6,1.0").unwrap();
+        let single = BucketMode::Gpk(GpBounds::parse_list("none").unwrap());
+        let mut seen = [0usize; 5];
+        for line in text.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let mut record = PackedSfenValue::default();
+            for i in 0..32 {
+                record.as_bytes_mut()[i] =
+                    u8::from_str_radix(&fields[0][2 * i..2 * i + 2], 16).unwrap();
+            }
+            let board = record.decode();
+            let oracle: u8 = fields[2].parse().unwrap();
+            let gp = shogi_features::gp5_progress_board(&board);
+            assert_eq!(gpk.bucket_board(&board, 5), oracle, "{line}");
+            assert_eq!(BucketMode::Gp5.bucket_board(&board, 5), oracle, "{line}");
+            let want_three = u8::from(gp >= 0.6) + u8::from(gp >= 1.0);
+            assert_eq!(three.bucket_board(&board, 3), want_three, "{line}");
+            assert_eq!(single.bucket_board(&board, 1), 0, "{line}");
+            seen[usize::from(oracle)] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+    }
+
+    /// Eight stacks from seven boundaries (`gpk:<7 values>`) parse, report 8 buckets, route
+    /// the oracle positions into `0..8` with the boundary-count rule, and round-trip
+    /// through the metadata name. Nine stacks (8 boundaries) are the maximum; ten are
+    /// rejected.
+    #[test]
+    fn gpk_with_seven_bounds_routes_eight_stacks() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("shogi-features/tests/fixtures/gp5_oracle.dat");
+        let text = std::fs::read_to_string(&fixture).expect("read gp5 oracle fixture");
+        let list = "0.15,0.3,0.45,0.6,0.75,0.9,1.05";
+        let (gp8, warning) = BucketMode::parse_cli(&format!("gpk:{list}")).unwrap();
+        assert!(warning.is_none());
+        let BucketMode::Gpk(bounds) = gp8 else {
+            panic!("gpk expected");
+        };
+        assert_eq!(bounds.num_buckets(), 8);
+        assert_eq!(bounds.as_slice().len(), 7);
+        assert_eq!(gp8.metadata_name(), format!("gpk:{list}"));
+        assert!(!gp8.is_gp5_routing());
+        let (again, _) = BucketMode::parse(&gp8.metadata_name()).unwrap();
+        assert!(matches!(again, BucketMode::Gpk(b) if b == bounds));
+        let mut seen = [0usize; 8];
+        for line in text.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let mut record = PackedSfenValue::default();
+            for i in 0..32 {
+                record.as_bytes_mut()[i] =
+                    u8::from_str_radix(&fields[0][2 * i..2 * i + 2], 16).unwrap();
+            }
+            let board = record.decode();
+            let gp = shogi_features::gp5_progress_board(&board);
+            let want = bounds.as_slice().iter().filter(|&&b| gp >= b).count() as u8;
+            let got = gp8.bucket_board(&board, 8);
+            assert_eq!(got, want, "{line}");
+            assert!(got < 8, "{line}");
+            seen[usize::from(got)] += 1;
+        }
+        assert!(seen.iter().sum::<usize>() > 0, "{seen:?}");
+        // 上限: 8 境界 (9 stacks) は受理、9 境界は拒否。
+        let nine = BucketMode::parse_cli("gpk:0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8").unwrap().0;
+        assert!(matches!(nine, BucketMode::Gpk(b) if b.num_buckets() == 9));
+        let err = BucketMode::parse_cli("gpk:0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9").unwrap_err();
+        assert!(err.contains("at most 8 boundaries"), "{err}");
+    }
+
+    /// Routes the first `TATARA_GPK_ROUTING_RECORDS` (default 327680) records of the PSV
+    /// file named by `TATARA_GPK_ROUTING_PSV` with `gp5` and with `gpk:0.4,0.6,0.8,1.0`,
+    /// requires identical buckets, and prints the bucket histogram.
+    #[test]
+    #[ignore = "requires an external PSV file (TATARA_GPK_ROUTING_PSV)"]
+    fn gpk_with_gp5_bounds_routes_external_psv_like_gp5() {
+        let path = std::env::var_os("TATARA_GPK_ROUTING_PSV").expect("set TATARA_GPK_ROUTING_PSV");
+        let limit: u64 = std::env::var("TATARA_GPK_ROUTING_RECORDS")
+            .ok()
+            .map_or(327_680, |v| v.parse().expect("record count"));
+        let (gpk, _) = BucketMode::parse_cli("gpk:0.4,0.6,0.8,1.0").unwrap();
+        let mut reader = BufReader::new(File::open(&path).expect("open PSV"));
+        let mut histogram = [0u64; 5];
+        let mut mismatches = 0u64;
+        let mut record = PackedSfenValue::default();
+        let mut read = 0u64;
+        while read < limit && reader.read_exact(record.as_bytes_mut()).is_ok() {
+            let board = record.decode();
+            let reference = BucketMode::Gp5.bucket_board(&board, 5);
+            mismatches += u64::from(gpk.bucket_board(&board, 5) != reference);
+            histogram[usize::from(reference)] += 1;
+            read += 1;
+        }
+        eprintln!(
+            "[gpk-routing] records={read} mismatches={mismatches} gp5_histogram={histogram:?}"
+        );
+        assert_eq!(read, limit, "PSV shorter than the requested record count");
+        assert_eq!(mismatches, 0);
     }
 
     /// shogi-format crate test fixture (100 records × 40 bytes = 4000 bytes)。

@@ -165,7 +165,9 @@ pub fn read_leb128_tensor_i16<R: Read>(
     let mut size_buf = [0u8; 4];
     reader.read_exact(&mut size_buf)?;
     let compressed_size = u32::from_le_bytes(size_buf) as usize;
-    if compressed_size == 0 || compressed_size > 256 * 1024 * 1024 {
+    // Sanity guard against corrupt sizes. A 1536-wide HalfKA2 FT (131,949 × 1536 i16) is
+    // about 360 MiB in LEB128, so the bound must stay above that.
+    if compressed_size == 0 || compressed_size > 1024 * 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid LEB128 block size: {compressed_size}"),
@@ -263,6 +265,9 @@ pub fn features_token(feature_name: &str, input_size: usize, ft_out: usize) -> S
 pub struct ThreatArch {
     pub dims: usize,
     pub profile_id: u32,
+    /// threat 座標の file mirror を切った spec (`ThreatMirror=off` token)。rshogi 契約
+    /// (mirror あり) は false で token を出さない。
+    pub mirror_off: bool,
 }
 
 /// arch_str / stream に書く effect bucket identity。`nb` は bucket 数、`king_bucketed`
@@ -313,12 +318,18 @@ pub fn build_arch_str(
     // `ThreatProfile=<id>` (と stream の u32 id) は profile id≠0 のときだけ付け、
     // id 0 = full では `ThreatProfile=`/u32 のみ省略する (`Threat=<dims>` は残す →
     // rshogi の「ThreatProfile= 無し = profile 0」経路で load される)。
+    // `ThreatMirror=off` は rshogi 契約の外 (mirror しない座標) を表す追加 token。
+    // mirror あり (契約どおり) では出さないので既存 artifact の arch_str は不変。
     let threat_part = match threat {
         Some(t) if t.profile_id != 0 => {
             format!("Threat={},ThreatProfile={},", t.dims, t.profile_id)
         }
         Some(t) => format!("Threat={},", t.dims),
         None => String::new(),
+    };
+    let threat_part = match threat {
+        Some(t) if t.mirror_off => format!("{threat_part}ThreatMirror=off,"),
+        _ => threat_part,
     };
     let effect_bucket_part = match effect_bucket {
         Some(e) => format!("EffectBucket={},", e.token_value()),
@@ -607,6 +618,7 @@ impl LayerStackWeights {
         let threat_arch = self.feature_set.threat_profile().map(|p| ThreatArch {
             dims: self.feature_set.threat_dims(),
             profile_id: p.profile_id(),
+            mirror_off: self.feature_set.threat_mirror_off(),
         });
         let effect_bucket_arch =
             self.feature_set
@@ -973,6 +985,35 @@ impl LayerStackWeights {
                     format!("arch_str has multiple EffectBucket= tokens: `{arch_str}`"),
                 )
             })?;
+        let file_threat_mirror =
+            parse_single_arch_token(&arch_str, "ThreatMirror=").map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("arch_str has multiple ThreatMirror= tokens: `{arch_str}`"),
+                )
+            })?;
+        // mirror off は token `ThreatMirror=off` の有無で判定する (hm は token 無し)。
+        // 期待 spec と食い違えば row の座標が違うので reject する。
+        let file_mirror_off = match file_threat_mirror {
+            None => false,
+            Some("off") => true,
+            Some(other) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid ThreatMirror= value `{other}` in arch_str (expected off)"),
+                ));
+            }
+        };
+        if file_mirror_off != expected.threat_mirror_off() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "threat mirror mismatch: file ThreatMirror={}, expected {} (arch_str = `{arch_str}`)",
+                    if file_mirror_off { "off" } else { "hm (no token)" },
+                    if expected.threat_mirror_off() { "off" } else { "hm (no token)" },
+                ),
+            ));
+        }
         let expected_threat = expected
             .threat_profile()
             .map(|p| (expected.threat_dims(), p.profile_id()));
@@ -2518,6 +2559,7 @@ mod tests {
             Some(ThreatArch {
                 dims: 96_320,
                 profile_id: 10,
+                mirror_off: false,
             }),
             None,
         );
@@ -2538,6 +2580,7 @@ mod tests {
             Some(ThreatArch {
                 dims: 216_720,
                 profile_id: 0,
+                mirror_off: false,
             }),
             None,
         );

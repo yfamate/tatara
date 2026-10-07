@@ -137,6 +137,10 @@ use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
+/// threat FT 行の学習時 clamp 範囲: export が int8 (±127) at QA なので `127 / QA`。
+const THREAT_W_CLAMP_MAX: f32 = 127.0 / nnue_format::layerstack_weights::QA as f32;
+const THREAT_W_CLAMP_MIN: f32 = -THREAT_W_CLAMP_MAX;
+
 struct StepContext<'a> {
     lr: f32,
     wdl_lambda: f32,
@@ -1046,9 +1050,12 @@ impl GpuTrainer {
         init_spec: &LayerStackInit,
         forward_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // A single bucket is valid: every per-bucket kernel takes `num_buckets` at runtime
+        // and routes rows with `0 <= bucket < num_buckets`. The CLI still restricts
+        // progresskpabs to two or more buckets.
         assert!(
-            (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
-            "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
+            (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
+            "GpuTrainer requires num_buckets in [1, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
@@ -1935,13 +1942,14 @@ impl GpuTrainer {
         let topo5 =
             layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
         let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
+        let bucket_mode = self.bucket_mode.metadata_name();
         save_raw_checkpoint_file(
             path,
             &self.stream,
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
-                bucket_mode: Some(self.bucket_mode.canonical_name()),
+                bucket_mode: Some(&bucket_mode),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -1987,12 +1995,13 @@ impl GpuTrainer {
             .iter()
             .map(|g| (g.name, g.len))
             .collect();
+        let bucket_mode = self.bucket_mode.metadata_name();
         let (header, loaded) = load_raw_checkpoint_file(
             path,
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
-                bucket_mode: Some(self.bucket_mode.canonical_name()),
+                bucket_mode: Some(&bucket_mode),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -4648,6 +4657,49 @@ impl GpuTrainer {
                 // m / v は同じ flag で `MomentBuf::zeroed` され、load/init でも同期するので
                 // 精度が食い違うことはない。
                 _ => unreachable!("ft_w m and v moment buffers always share precision"),
+            }
+        }
+        // threat FT 行は int8 (FT scale) で export されるので、optimizer step の後に
+        // `|w| <= 127/QA` へ clamp して量子化誤差を学習中に見せる (dense 層の QB clamp と
+        // 同じ方針)。factorizer 有効時は threat pair の仮想行も同じ範囲に clamp する
+        // (export 値 = 実行 + 仮想行。L1 の per-bucket + shared と同じく各 group を独立に
+        // clamp する)。fp16 mirror は factorizer 無効時だけ存在し、同時に書き直す。
+        if self.feature_set.threat_profile().is_some() {
+            let base_rows = self.feature_set.base_ft_in();
+            let threat_rows = self.feature_set.threat_dims();
+            let mut ranges: [(usize, usize); 2] = [(base_rows * ft_out, threat_rows * ft_out), (0, 0)];
+            if ft_factorize {
+                let pair_rows = self.feature_set.threat_factorize_pair_count();
+                let virtual_base_rows =
+                    self.feature_set.ft_in() + self.feature_set.ft_factorize_virtual_rows() - pair_rows;
+                ranges[1] = (virtual_base_rows * ft_out, pair_rows * ft_out);
+            }
+            for (offset, n) in ranges {
+                if n == 0 {
+                    continue;
+                }
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: clamp_range_mirror,
+                            stream: self.stream, module: self.module, config: cfg_1d(n),
+                            args: [slice_mut(self.ft_w), slice_mut(ft_w_h), offset as u32, n as u32,
+                                   THREAT_W_CLAMP_MIN, THREAT_W_CLAMP_MAX]
+                        }
+                    }?;
+                } else {
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: clamp_range,
+                            stream: self.stream, module: self.module, config: cfg_1d(n),
+                            args: [slice_mut(self.ft_w), offset as u32, n as u32,
+                                   THREAT_W_CLAMP_MIN, THREAT_W_CLAMP_MAX]
+                        }
+                    }?;
+                }
             }
         }
         // 一様 (非 FT) weight group を 1 配列に集約し、radam pass / lerp pass をそれぞれ

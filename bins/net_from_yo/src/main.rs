@@ -85,6 +85,17 @@ struct Args {
     /// Quantised `.bin` files do not record their bucket routing mode.
     #[arg(long)]
     assume_kingrank9: bool,
+    /// Assert Cyfamate GP5 routing; accepts its fixed 1024/8/64 architecture (or the H15 prototype 1024/16/64) only.
+    #[arg(long, conflicts_with = "assume_kingrank9")]
+    assume_gp5: bool,
+    /// Read a Cyfamate GP-bucket file (header carries the boundaries, FT width, fc_0
+    /// width and threat tokens; the fixed GP5 file is accepted too). The boundaries are
+    /// printed so the tatara side can be run with the matching `--bucket-mode gpk:<list>`.
+    #[arg(long, conflicts_with_all = ["assume_kingrank9", "assume_gp5"])]
+    assume_cyfamate_gp: bool,
+    /// Engine divisor used by the input net (Cyfamate defaults to 16).
+    #[arg(long)]
+    fv_scale: Option<i32>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,16 +103,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
-    require_kingrank9_assertion(args.assume_kingrank9)?;
+    if args.assume_cyfamate_gp {
+        let input = File::open(&args.input)?;
+        let mut reader = BufReader::new(input);
+        let (weights, arch) = nnue_format::read_yaneuraou_cyfamate(&mut reader)?;
+        reject_trailing_data(&mut reader)?;
+        let fv_scale = args.fv_scale.unwrap_or(16);
+        if fv_scale <= 0 {
+            return Err("fv-scale must be positive".into());
+        }
+        let output = File::create(&args.output)?;
+        let mut writer = BufWriter::new(output);
+        weights.save_quantised(&mut writer, Some(fv_scale))?;
+        writer.flush()?;
+        println!(
+            "wrote {} (ft_out={} l1_out={} l2_out={} stacks={} threat={} bucket-mode gpk:{})",
+            args.output.display(),
+            arch.ft_out,
+            arch.l1_out,
+            arch.l2_out,
+            arch.buckets(),
+            match arch.threat {
+                Some((p, m)) => format!("{p}/{}", m.name()),
+                None => "off".to_string(),
+            },
+            arch.gp_bounds
+                .iter()
+                .map(|b| format!("{b:?}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        return Ok(());
+    }
+    if !args.assume_gp5 {
+        require_kingrank9_assertion(args.assume_kingrank9)?;
+    }
 
     let input = File::open(&args.input)?;
     let mut reader = BufReader::new(input);
     let weights = read_yo(&mut reader)?;
+    if weights.num_buckets != if args.assume_gp5 { 5 } else { 9 } {
+        return Err("routing assertion disagrees with input bucket count".into());
+    }
     reject_trailing_data(&mut reader)?;
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
-    weights.save_quantised(&mut writer, Some(nnue_format::layerstack_weights::FV_SCALE))?;
+    let fv_scale = args.fv_scale.unwrap_or(if args.assume_gp5 {
+        16
+    } else {
+        nnue_format::layerstack_weights::FV_SCALE
+    });
+    if fv_scale <= 0 {
+        return Err("fv-scale must be positive".into());
+    }
+    weights.save_quantised(&mut writer, Some(fv_scale))?;
     writer.flush()?;
     Ok(())
 }
@@ -118,7 +174,13 @@ fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
 
 fn read_yo<R: BufRead>(reader: &mut R) -> io::Result<LayerStackWeights> {
     expect_u32(reader, YO_VERSION, "version")?;
-    expect_u32(reader, YO_TOP_HASH, "top-level hash")?;
+    let top_hash = read_u32(reader)?;
+    if top_hash != YO_TOP_HASH
+        && top_hash != (YO_TOP_HASH ^ 0x3547_5000)
+        && top_hash != (YO_TOP_HASH ^ 0x3547_5000 ^ 0x3531_4831)
+    {
+        return invalid_data("invalid top-level hash");
+    }
 
     let arch_len = read_u32(reader)? as usize;
     if arch_len == 0 || arch_len > 16_384 {
@@ -133,8 +195,22 @@ fn read_yo<R: BufRead>(reader: &mut R) -> io::Result<LayerStackWeights> {
         )
     })?;
     let detected = parse_yo_arch(arch)?;
+    let gp5 = detected.num_buckets == 5;
+    if top_hash
+        != if gp5 {
+            // Cyfamate GP5 "5GP\0"; the H15 prototype (l1_out 16) also XORs "1H15".
+            YO_TOP_HASH ^ 0x3547_5000 ^ if detected.l1_out == 16 { 0x3531_4831 } else { 0 }
+        } else {
+            YO_TOP_HASH
+        }
+    {
+        return invalid_data("top-level hash disagrees with architecture");
+    }
 
-    expect_u32(reader, YO_FT_HASH, "feature-transformer hash")?;
+    let ft_hash = read_u32(reader)?;
+    if ft_hash != YO_FT_HASH && !(gp5 && ft_hash == 0x5f13_48b8) {
+        return invalid_data("invalid feature-transformer hash");
+    }
     consume_optional_leb128_prefix(reader)?;
 
     read_yo_tensors(
@@ -151,6 +227,29 @@ fn read_yo<R: BufRead>(reader: &mut R) -> io::Result<LayerStackWeights> {
 /// [<in>-><ft>x2],Network=<struct>{LayerStack=<n>}`) から feature set と次元を検出する。
 /// PSQT 付き (`SFNNWithoutPsqt` でない) や未知 feature は変換不可として reject。
 fn parse_yo_arch(arch: &str) -> io::Result<DetectedArch> {
+    if arch
+        == "ModelType=SFNNWithoutPsqt;Features=HalfKA2(Friend)[131949->1024x2],Network=SFNN_HALFKA2_1024_7_64_5GP{LayerStack=5;Bucket=GP(0.4,0.6,0.8,1)}"
+    {
+        return Ok(DetectedArch {
+            feature_set: FeatureSet::HalfKaMerged,
+            ft_out: 1024,
+            l1_out: 8,
+            l2_out: 64,
+            num_buckets: 5,
+        });
+    }
+    if arch
+        == "ModelType=SFNNWithoutPsqt;Features=HalfKA2(Friend)[131949->1024x2],Network=SFNN_HALFKA2_1024_15_64_5GP{LayerStack=5;Bucket=GP(0.4,0.6,0.8,1)}"
+    {
+        // Cyfamate GP5 H15 prototype: fc_0 hidden 15 + shortcut.
+        return Ok(DetectedArch {
+            feature_set: FeatureSet::HalfKaMerged,
+            ft_out: 1024,
+            l1_out: 16,
+            l2_out: 64,
+            num_buckets: 5,
+        });
+    }
     if !arch.starts_with("ModelType=SFNNWithoutPsqt;") {
         return invalid_data(format!(
             "unsupported YaneuraOu architecture (expected ModelType=SFNNWithoutPsqt): `{arch}`"
@@ -341,7 +440,10 @@ fn read_yo_tensors<R: BufRead>(
 
     let l2_in = (l1_out - 1) * 2;
     for bucket in 0..num_buckets {
-        expect_u32(reader, YO_NETWORK_HASH, "LayerStack hash")?;
+        let hash = read_u32(reader)?;
+        if hash != YO_NETWORK_HASH && !(num_buckets == 5 && hash == 0x6333_76a4) {
+            return invalid_data("invalid LayerStack hash");
+        }
 
         let (biases, dense_weights) = read_affine(reader, ft_out, l1_out)?;
         let l1_b_start = bucket * l1_out;

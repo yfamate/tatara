@@ -1305,6 +1305,7 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
                 options.num_buckets,
             ),
             threat_profile: "off".to_string(),
+            threat_mirror: "hm".to_string(),
             effect_bucket: "off".to_string(),
             ft_factorize: "off",
             psqt: false,
@@ -1580,6 +1581,142 @@ fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std
         "[native-layerstack-host-parity] loss_bits={:016x}, state_fingerprint_1e6={fingerprint:016x}",
         loss.to_bits()
     );
+    Ok(())
+}
+
+/// A single-bucket LayerStack trains like a two-bucket one whose rows all fall in bucket 0:
+/// the same loss before and after one step, the same updated shared and bucket-0 weights,
+/// and an untouched empty bucket. This pins the per-bucket kernels at `num_buckets = 1`.
+#[test]
+fn single_bucket_layerstack_matches_two_buckets_with_one_populated()
+-> Result<(), Box<dyn std::error::Error>> {
+    fn assert_close(name: &str, expected: &[f32], actual: &[f32]) {
+        assert_eq!(expected.len(), actual.len(), "{name} length");
+        let mut worst = 0.0_f32;
+        for (i, (&want, &got)) in expected.iter().zip(actual).enumerate() {
+            let diff = (want - got).abs();
+            assert!(
+                diff <= 1.0e-8 + 1.0e-5 * want.abs(),
+                "{name}[{i}] differs: two-bucket={want}, single-bucket={got}"
+            );
+            worst = worst.max(diff);
+        }
+        eprintln!("[single-bucket] {name}: max_abs_diff={worst:.3e}");
+    }
+
+    let context = CudaContext::new(0)?;
+    let two = LayerStackTestOptions::standard();
+    assert_eq!(two.num_buckets, 2);
+    let one = LayerStackTestOptions {
+        num_buckets: 1,
+        bucket_mode: BucketMode::Gpk(nnue_train::dataloader::GpBounds::new(&[])?),
+        ..two
+    };
+    let (ft_out, l1_out, l2_out) = (two.ft_out, two.l1_out, two.l2_out);
+    let l2_in = (l1_out - 1) * 2;
+    let bucket0 = |w: &nnue_format::LayerStackWeights| {
+        (
+            w.l1_w[..l1_out * ft_out].to_vec(),
+            w.l1_b[..l1_out].to_vec(),
+            w.l2_w[..l2_out * l2_in].to_vec(),
+            w.l2_b[..l2_out].to_vec(),
+            w.l3_w[..l2_out].to_vec(),
+            w.l3_b[..1].to_vec(),
+        )
+    };
+
+    let mut control = create_layerstack_trainer_with_options(&context, true, two)?;
+    let initial = control.to_layerstack_weights()?;
+    let mut sliced = initial.clone();
+    sliced.num_buckets = 1;
+    (
+        sliced.l1_w,
+        sliced.l1_b,
+        sliced.l2_w,
+        sliced.l2_b,
+        sliced.l3_w,
+        sliced.l3_b,
+    ) = bucket0(&initial);
+    let mut single = create_layerstack_trainer_with_options(&context, true, one)?;
+    single.load_layerstack_weights(&sliced)?;
+    single.sync_ft_forward_weights()?;
+
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, two.feature_set);
+    batch.bucket_idx.fill(0);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+
+    let loss = |trainer: &mut LayerStackGpuTrainer| -> Result<f64, Box<dyn std::error::Error>> {
+        Ok(f64::from(
+            trainer.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?.loss,
+        ))
+    };
+    let before = (loss(&mut control)?, loss(&mut single)?);
+    assert!(
+        (before.0 - before.1).abs() <= 1.0e-6 * before.0.abs(),
+        "loss before step: {before:?}"
+    );
+    let _ = control.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let _ = single.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let after = (loss(&mut control)?, loss(&mut single)?);
+    assert!(
+        (after.0 - after.1).abs() <= 1.0e-6 * after.0.abs(),
+        "loss after step: {after:?}"
+    );
+    assert!(after.1 != before.1, "the step must change the loss");
+    eprintln!("[single-bucket] loss before={before:?} after={after:?}");
+    single.assert_all_weights_finite()?;
+
+    let trained_two = control.to_layerstack_weights()?;
+    let trained_one = single.to_layerstack_weights()?;
+    assert_eq!(trained_one.num_buckets, 1);
+    assert_close("ft_w", &trained_two.ft_w, &trained_one.ft_w);
+    assert_close("ft_b", &trained_two.ft_b, &trained_one.ft_b);
+    assert_close(
+        "l1_shared_weight",
+        &trained_two.l1_shared_weight,
+        &trained_one.l1_shared_weight,
+    );
+    assert_close(
+        "l1_shared_bias",
+        &trained_two.l1_shared_bias,
+        &trained_one.l1_shared_bias,
+    );
+    let (two_l1w, two_l1b, two_l2w, two_l2b, two_l3w, two_l3b) = bucket0(&trained_two);
+    assert_close("l1_w", &two_l1w, &trained_one.l1_w);
+    assert_close("l1_b", &two_l1b, &trained_one.l1_b);
+    assert_close("l2_w", &two_l2w, &trained_one.l2_w);
+    assert_close("l2_b", &two_l2b, &trained_one.l2_b);
+    assert_close("l3_w", &two_l3w, &trained_one.l3_w);
+    assert_close("l3_b", &two_l3b, &trained_one.l3_b);
+    let (init_l1w, init_l1b, init_l2w, init_l2b, init_l3w, init_l3b) = bucket0(&initial);
+    let moved = [
+        ("l1_w", two_l1w != init_l1w),
+        ("l1_b", two_l1b != init_l1b),
+        ("l2_w", two_l2w != init_l2w),
+        ("l2_b", two_l2b != init_l2b),
+        ("l3_w", two_l3w != init_l3w),
+        ("l3_b", two_l3b != init_l3b),
+    ];
+    eprintln!("[single-bucket] bucket-0 groups moved by the step: {moved:?}");
+    assert!(
+        moved.iter().any(|&(_, changed)| changed),
+        "bucket 0 must have been trained"
+    );
+    for (name, trained, init, bucket_len) in [
+        ("l1_w", &trained_two.l1_w, &initial.l1_w, l1_out * ft_out),
+        ("l1_b", &trained_two.l1_b, &initial.l1_b, l1_out),
+        ("l2_w", &trained_two.l2_w, &initial.l2_w, l2_out * l2_in),
+        ("l2_b", &trained_two.l2_b, &initial.l2_b, l2_out),
+        ("l3_w", &trained_two.l3_w, &initial.l3_w, l2_out),
+        ("l3_b", &trained_two.l3_b, &initial.l3_b, 1),
+    ] {
+        assert_eq!(
+            trained[bucket_len..],
+            init[bucket_len..],
+            "the empty bucket of {name} must not move"
+        );
+    }
     Ok(())
 }
 

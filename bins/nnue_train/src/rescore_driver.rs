@@ -173,6 +173,8 @@ pub(crate) struct RescoreConfig<'a> {
     pub(crate) arch: String,
     /// threat profile の CLI 名 (`off` 含む)。
     pub(crate) threat_profile: String,
+    /// threat 座標の mirror 方式の CLI 名 (`hm` / `off`)。
+    pub(crate) threat_mirror: String,
     /// effect bucket 構成の CLI 名 (`off` 含む)。
     pub(crate) effect_bucket: String,
     /// FT factorizer mode (`off` / `base` / `pool-effect-buckets` /
@@ -231,11 +233,12 @@ impl Fingerprint {
             ("arch", cfg.arch.clone()),
             ("feature_set", cfg.feature_set.canonical_name().to_string()),
             ("threat_profile", cfg.threat_profile.clone()),
+            ("threat_mirror", cfg.threat_mirror.clone()),
             ("effect_bucket", cfg.effect_bucket.clone()),
             ("ft_factorize", cfg.ft_factorize.to_string()),
             ("psqt", cfg.psqt.to_string()),
             ("stack_shared_delta", cfg.stack_shared_delta.to_string()),
-            ("bucket_mode", cfg.bucket_mode.canonical_name().to_string()),
+            ("bucket_mode", cfg.bucket_mode.metadata_name()),
             ("num_buckets", cfg.num_buckets.to_string()),
         ];
         if let Some(coeff) = &cfg.progress_coeff {
@@ -501,6 +504,7 @@ mod tests {
             weights_source: "init-from-bin",
             arch: "LayerStack-128-16-32-9bucket".to_string(),
             threat_profile: "off".to_string(),
+            threat_mirror: "hm".to_string(),
             effect_bucket: "off".to_string(),
             ft_factorize: "off",
             psqt: false,
@@ -607,6 +611,37 @@ mod tests {
         assert_eq!(meta["threat_profile"], serde_json::json!("off"));
         assert_eq!(meta["ft_factorize"], serde_json::json!("off"));
         assert_eq!(meta["psqt"], serde_json::json!("false"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gpk の境界列は fingerprint に入り、境界だけが異なる sidecar は別物として扱われる。
+    #[test]
+    fn fingerprint_distinguishes_gpk_boundaries() {
+        let dir = temp_dir("gpk");
+        let input = dir.join("in.psv");
+        std::fs::write(&input, vec![0_u8; 40 * 2]).unwrap();
+        let net_path = dir.join("net.bin");
+        let net_bytes = b"net bytes".to_vec();
+        std::fs::write(&net_path, &net_bytes).unwrap();
+        let out_dir = dir.join("out");
+        let text_for = |list: &str| {
+            let net = LoadedArtifact::from_loaded_bytes(&net_path, &net_bytes).unwrap();
+            let mut cfg = test_config(&input, &out_dir, net, None);
+            let (mode, _) = BucketMode::parse_cli(&format!("gpk:{list}")).unwrap();
+            cfg.bucket_mode = mode;
+            cfg.num_buckets = list.split(',').count() + 1;
+            Fingerprint::build(&cfg, 2).unwrap().text()
+        };
+        let gp5_bounds = text_for("0.4,0.6,0.8,1");
+        assert!(
+            gp5_bounds.contains("bucket_mode=gpk:0.4,0.6,0.8,1.0\n"),
+            "{gp5_bounds}"
+        );
+        let shifted = text_for("0.4,0.6,0.8,1.1");
+        assert!(
+            shifted.contains("bucket_mode=gpk:0.4,0.6,0.8,1.1\n"),
+            "{shifted}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
