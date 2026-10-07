@@ -38,7 +38,8 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// given. progress-kpabs assigns each position to `floor(p * num_buckets)`,
 /// so the default 9 keeps the binning + weight-buffer shape identical to the
 /// historical layout and resume-compatible with existing checkpoints. The
-/// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
+/// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]` for progresskpabs and
+/// `[1, MAX_SUPPORTED_NUM_BUCKETS]` for gpk.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
 /// Maximum supported bucket count without changing the per-bucket weight

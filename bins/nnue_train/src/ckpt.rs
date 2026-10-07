@@ -32,8 +32,9 @@ use crate::trainer_common::MomentBuf;
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
 //   arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、例 "layerstack")
 //   bucket_mode_len u32              (v8+、bucket mode 名の長さ、bucket 無しは 0)
-//   bucket_mode  UTF-8 [bucket_mode_len] (例 "progresskpabs" / "kingrank9"。
-//                reader は非推奨 alias "progress8kpabs" も progresskpabs として受理)
+//   bucket_mode  UTF-8 [bucket_mode_len] (例 "progresskpabs" / "kingrank9" /
+//                "gpk:0.4,0.6,0.8,1.0" (境界列込み)。reader は非推奨 alias
+//                "progress8kpabs" も progresskpabs として受理)
 //   topo_count   u64                 (topology 次元の個数)
 //   topology     u64 [topo_count]     (arch 固有の層次元列)
 //   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
@@ -535,11 +536,12 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 invalid_data("raw checkpoint bucket mode name is not valid UTF-8".to_string())
             })?;
             // 旧名 alias で書かれた checkpoint も canonical 名の checkpoint と同じ
-            // mode として照合する。未知の mode 名は正規化せずそのまま比較に回し、
-            // 下の不一致エラーで surface させる。
+            // mode として照合する。gpk は境界列込みの名前に正規化して境界まで照合する。
+            // 未知の mode 名は正規化せずそのまま比較に回し、下の不一致エラーで
+            // surface させる。
             (!bucket_mode.is_empty()).then(|| {
                 BucketMode::parse(&bucket_mode)
-                    .map_or(bucket_mode, |(mode, _)| mode.canonical_name().to_string())
+                    .map_or(bucket_mode, |(mode, _)| mode.metadata_name())
             })
         } else if ckpt_arch == ArchKind::LayerStack {
             // bucket-mode header を持たない version の LayerStack は、当時唯一の

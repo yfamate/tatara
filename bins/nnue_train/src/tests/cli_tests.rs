@@ -1169,6 +1169,160 @@ fn kingrank9_bucket_mode_validation() {
 }
 
 #[test]
+fn gp5_requires_five_buckets_without_progress_coeff() {
+    let valid = layerstack_args(&["--bucket-mode", "gp5", "--num-buckets", "5"]);
+    assert!(matches!(
+        validate_bucket_mode(&valid).unwrap(),
+        nnue_train::dataloader::BucketMode::Gp5
+    ));
+    for flags in [
+        vec!["--bucket-mode", "gp5", "--num-buckets", "9"],
+        vec![
+            "--bucket-mode",
+            "gp5",
+            "--num-buckets",
+            "5",
+            "--progress-coeff",
+            "progress.bin",
+        ],
+    ] {
+        assert!(validate_bucket_mode(&layerstack_args(&flags)).is_err());
+    }
+    assert!(
+        validate_output_format(
+            OutputFormatArg::Yaneuraou,
+            nnue_train::dataloader::BucketMode::Gp5
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn gpk_bucket_mode_validation() {
+    use nnue_train::dataloader::BucketMode;
+
+    let gp5_bounds = layerstack_args(&[
+        "--bucket-mode",
+        "gpk",
+        "--gp-bounds",
+        "0.4,0.6,0.8,1.0",
+        "--num-buckets",
+        "5",
+    ]);
+    let mode = validate_bucket_mode(&gp5_bounds).unwrap();
+    assert!(matches!(mode, BucketMode::Gpk(_)));
+    assert_eq!(mode.metadata_name(), "gpk:0.4,0.6,0.8,1.0");
+    assert!(mode.is_gp5_routing());
+    validate_output_format(OutputFormatArg::Yaneuraou, mode)
+        .expect("gpk with the gp5 boundaries is the gp5 partition");
+
+    // The recorded self-describing name is accepted as-is.
+    let recorded = layerstack_args(&["--bucket-mode", "gpk:0.4,0.6,0.8,1.0", "--num-buckets", "5"]);
+    assert_eq!(
+        validate_bucket_mode(&recorded).unwrap().metadata_name(),
+        "gpk:0.4,0.6,0.8,1.0"
+    );
+
+    for (buckets, list) in [
+        ("1", "none"),
+        ("2", "0.8"),
+        ("3", "0.6,1.0"),
+        ("9", "0.2,0.3,0.4,0.5,0.6,0.7,0.8,1.0"),
+    ] {
+        let args = layerstack_args(&[
+            "--bucket-mode",
+            "gpk",
+            "--gp-bounds",
+            list,
+            "--num-buckets",
+            buckets,
+        ]);
+        let mode = validate_bucket_mode(&args).unwrap_or_else(|e| panic!("{list}: {e}"));
+        let BucketMode::Gpk(bounds) = mode else {
+            panic!("{list} must select gpk");
+        };
+        assert_eq!(bounds.num_buckets().to_string(), buckets);
+        assert!(!mode.is_gp5_routing());
+        let err = validate_output_format(OutputFormatArg::Yaneuraou, mode)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--output-format tatara"), "{err}");
+        validate_output_format(OutputFormatArg::Tatara, mode).expect("tatara output takes any K");
+    }
+
+    for (flags, needle) in [
+        (vec!["--bucket-mode", "gpk", "--num-buckets", "5"], "requires --gp-bounds"),
+        (
+            vec!["--bucket-mode", "gpk", "--gp-bounds", "0.4,0.6,0.8,1.0", "--num-buckets", "9"],
+            "defines 5 bucket(s)",
+        ),
+        (
+            vec!["--bucket-mode", "gpk", "--gp-bounds", "none", "--num-buckets", "9"],
+            "defines 1 bucket(s)",
+        ),
+        (
+            vec!["--bucket-mode", "gpk", "--gp-bounds", "0.8,0.6", "--num-buckets", "3"],
+            "strictly increasing",
+        ),
+        (
+            vec!["--bucket-mode", "gpk", "--gp-bounds", "0.4,1.6", "--num-buckets", "3"],
+            "outside",
+        ),
+        (
+            vec![
+                "--bucket-mode",
+                "gpk",
+                "--gp-bounds",
+                "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
+                "--num-buckets",
+                "9",
+            ],
+            "at most 8",
+        ),
+        (
+            vec!["--bucket-mode", "gp5", "--gp-bounds", "0.4,0.6,0.8,1.0", "--num-buckets", "5"],
+            "only used with --bucket-mode gpk",
+        ),
+        (
+            vec![
+                "--bucket-mode",
+                "gpk:0.4,0.6,0.8,1.0",
+                "--gp-bounds",
+                "0.4,0.6,0.8,1.0",
+                "--num-buckets",
+                "5",
+            ],
+            "not both",
+        ),
+        (
+            vec![
+                "--bucket-mode",
+                "gpk",
+                "--gp-bounds",
+                "0.4,0.6,0.8,1.0",
+                "--num-buckets",
+                "5",
+                "--progress-coeff",
+                "progress.bin",
+            ],
+            "not used",
+        ),
+        (vec!["--bucket-mode", "gpk:0.4,x", "--num-buckets", "3"], "not a number"),
+    ] {
+        let err = validate_bucket_mode(&layerstack_args(&flags))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(needle), "{flags:?}: {err}");
+    }
+
+    // progresskpabs keeps its two-bucket lower bound.
+    let err = validate_bucket_mode(&layerstack_args(&["--num-buckets", "1"]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("[2, 9]"), "{err}");
+}
+
+#[test]
 fn progresskpabs_bucket_mode_accepts_canonical_and_legacy_alias() {
     let canonical = layerstack_args(&["--bucket-mode", "progresskpabs"]);
     assert!(matches!(

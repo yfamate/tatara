@@ -458,6 +458,55 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
     }
 }
 
+fn layerstack_arch_named(bucket_mode: &str) -> RawCkptArch<'_> {
+    RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        arch_kind: ArchKind::LayerStack,
+        bucket_mode: Some(bucket_mode),
+        ft_out: DEFAULT_FT_OUT as u64,
+        topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+    }
+}
+
+/// gpk checkpoints carry their boundary list; resume accepts only the same partition.
+#[test]
+fn raw_ckpt_gpk_boundaries_round_trip_and_reject_other_partitions() {
+    let metadata = |name: &str| BucketMode::parse(name).unwrap().0.metadata_name();
+    let gp5_bounds = metadata("gpk:0.4,0.6,0.8,1");
+    assert_eq!(gp5_bounds, "gpk:0.4,0.6,0.8,1.0");
+    let shifted = metadata("gpk:0.4,0.6,0.8,1.1");
+    let single = metadata("gpk:none");
+
+    // Same partition, including a non-canonical spelling of the same values.
+    for written in [gp5_bounds.as_str(), "gpk:0.4,0.60,0.8,1"] {
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &layerstack_arch_named(written), "gpk", 4, 40, None, 10)
+            .unwrap();
+        let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch_named(&gp5_bounds))
+            .unwrap();
+        assert_eq!((h.superbatch, h.step_count, h.num_groups), (4, 40, 10));
+    }
+
+    for (written, requested) in [
+        (gp5_bounds.as_str(), shifted.as_str()),
+        (shifted.as_str(), gp5_bounds.as_str()),
+        (gp5_bounds.as_str(), "gp5"),
+        ("gp5", gp5_bounds.as_str()),
+        (single.as_str(), gp5_bounds.as_str()),
+        (gp5_bounds.as_str(), "progresskpabs"),
+    ] {
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &layerstack_arch_named(written), "", 1, 0, None, 10)
+            .unwrap();
+        let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch_named(requested))
+            .expect_err("a different partition must not resume");
+        assert_eq!(
+            err.to_string(),
+            format!("checkpoint bucket mode '{written}' does not match --bucket-mode '{requested}'")
+        );
+    }
+}
+
 #[test]
 fn raw_ckpt_v7_layerstack_defaults_to_progresskpabs() {
     let progress = layerstack_arch_with_mode("progresskpabs");

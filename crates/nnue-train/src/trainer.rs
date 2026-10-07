@@ -568,7 +568,7 @@ impl TrainingConfig {
         }
         if self.num_buckets == 0 {
             return Err(io::Error::other(
-                "num_buckets must be >= 1 (LayerStack uses `--num-buckets` in [2, 9])",
+                "num_buckets must be >= 1 (LayerStack uses `--num-buckets` in [1, 9])",
             ));
         }
         Ok(())
