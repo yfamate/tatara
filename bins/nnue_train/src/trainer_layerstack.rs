@@ -1723,7 +1723,10 @@ impl GpuTrainer {
             feature_set: if self.feature_set.ft_factorize() {
                 let base = self.feature_set.feature_set().spec();
                 if let Some(profile) = self.feature_set.threat_profile() {
+                    // threat mirror も保持する (落とすと `--threat-mirror off` で学習した
+                    // net が mirror あり (hm) の header / hash で書き出される)。
                     base.with_threat_profile(profile)
+                        .with_threat_mirror(self.feature_set.threat_mirror())
                 } else if let Some(config) = self.feature_set.effect_bucket_config() {
                     base.with_effect_bucket_config(config)
                 } else {

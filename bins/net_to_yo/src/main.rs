@@ -51,6 +51,12 @@ struct Args {
     /// GP5 file.
     #[arg(long, conflicts_with_all = ["assume_kingrank9", "assume_gp5"])]
     cyfamate_gp_bounds: Option<String>,
+    /// Assert that a threat net was trained with `--threat-mirror off` although its header
+    /// says hm. nnue_train before the export fix dropped the mirror mode from the export
+    /// spec whenever the FT factorizer was on (the default), so such `.bin` files carry
+    /// raw-square threat rows under an hm header/hash. Only with `--cyfamate-gp-bounds`.
+    #[arg(long, requires = "cyfamate_gp_bounds")]
+    assume_threat_mirror_off: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("input and output must be different paths".into());
     }
     if let Some(list) = &args.cyfamate_gp_bounds {
-        return convert_cyfamate(&args.input, &args.output, list);
+        return convert_cyfamate(&args.input, &args.output, list, args.assume_threat_mirror_off);
     }
     if !args.assume_gp5 {
         require_kingrank9_assertion(args.assume_kingrank9)?;
@@ -95,6 +101,7 @@ fn convert_cyfamate(
     input: &PathBuf,
     output: &PathBuf,
     bounds_list: &str,
+    assume_threat_mirror_off: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bounds: Vec<f64> = bounds_list
         .split(',')
@@ -123,7 +130,7 @@ fn convert_cyfamate(
         }
     }
     let mut reader = std::io::Cursor::new(&bytes);
-    let weights = LayerStackWeights::load_quantised(
+    let mut weights = LayerStackWeights::load_quantised(
         &mut reader,
         spec,
         meta.ft_out,
@@ -132,9 +139,23 @@ fn convert_cyfamate(
         meta.num_buckets,
     )?;
     reject_trailing_data(&mut reader)?;
+    let mut threat_mirror_off = meta.threat_mirror_off;
+    if assume_threat_mirror_off {
+        if meta.threat_profile.is_none() {
+            return Err("--assume-threat-mirror-off needs a net with a threat profile".into());
+        }
+        // The header was loaded (and its hash checked) as written; only the mirror
+        // identity is corrected. Threat dims do not depend on the mirror mode.
+        weights.feature_set = weights.feature_set.with_threat_mirror(ThreatMirror::Off);
+        threat_mirror_off = true;
+    }
+    // Serialise fully before touching the output path so a rejected net leaves no
+    // empty file behind.
+    let mut buf = Vec::new();
+    save_yaneuraou_cyfamate(&mut buf, &weights, &bounds)?;
     let out = File::create(output)?;
     let mut writer = BufWriter::new(out);
-    save_yaneuraou_cyfamate(&mut writer, &weights, &bounds)?;
+    writer.write_all(&buf)?;
     writer.flush()?;
     println!(
         "wrote {} ({} ft_out={} l1_out={} l2_out={} stacks={} threat={} bounds={bounds_list})",
@@ -144,7 +165,7 @@ fn convert_cyfamate(
         meta.l1_out,
         meta.l2_out,
         meta.num_buckets,
-        match (meta.threat_profile, meta.threat_mirror_off) {
+        match (meta.threat_profile, threat_mirror_off) {
             (Some(p), off) => format!("{p}/{}", if off { "off" } else { "hm" }),
             (None, _) => "off".to_string(),
         }
