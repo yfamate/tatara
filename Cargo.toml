@@ -19,6 +19,7 @@ members = [
     "bins/threat_symmetric_survey",
     "bins/threat_delta_survey",
     "bins/net_random",
+    "bins/gp_quantile",
 ]
 
 [workspace.package]
