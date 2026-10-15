@@ -40,6 +40,9 @@ struct Args {
     /// Largest |FT weight| in QA units (base rows); threat rows are always within ±127.
     #[arg(long, default_value_t = 300)]
     ft_range: i32,
+    /// Write an all-zero net (FT, threat FT, every layer and bias = 0): the "null" evaluation, eval = 0 everywhere.
+    #[arg(long)]
+    zero: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,6 +66,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s
     };
     let base_n = spec.base_ft_in() * args.ft_out;
+    if args.zero {
+        let mut out = BufWriter::new(File::create(&args.output)?);
+        w.save_quantised(&mut out, Some(args.fv_scale))?;
+        out.flush()?;
+        println!("wrote {} (all-zero null net, feature_set={} ft_out={} l1={} l2={} buckets={})", args.output.display(),
+                 spec.canonical_name(), args.ft_out, args.l1, args.l2, args.num_buckets);
+        return Ok(());
+    }
     let ft_span = (2 * args.ft_range + 1) as u64;
     for (i, v) in w.ft_w.iter_mut().enumerate() {
         let r = next();
