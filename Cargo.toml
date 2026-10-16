@@ -20,6 +20,7 @@ members = [
     "bins/threat_delta_survey",
     "bins/net_random",
     "bins/gp_quantile",
+    "bins/net_bucket_select",
 ]
 
 [workspace.package]
