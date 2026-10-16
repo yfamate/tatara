@@ -24,9 +24,13 @@ use shogi_format::PackedSfenValue;
 #[command(name = "gp-quantile")]
 #[command(about = "k-quantile boundaries of the board progress (GP) over PSV data")]
 struct Args {
-    /// PSV data files, comma-separated. Samples are split evenly across them.
+    /// PSV data files, comma-separated. Samples are split in proportion to each file's record count
+    /// (so the quantiles follow the training distribution of the concatenated data); --even splits them evenly.
     #[arg(long)]
     data: String,
+    /// Old behaviour: the same number of samples from every file regardless of its size.
+    #[arg(long)]
+    even: bool,
 
     /// Total positions to sample.
     #[arg(long, default_value_t = 4_000_000)]
@@ -110,10 +114,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("--data is required".into());
     }
     let mut gps = Vec::with_capacity(args.samples);
-    let per_file = args.samples.div_ceil(paths.len());
+    let sizes: Vec<u64> = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len() / 40).unwrap_or(0)).collect();
+    let total: u64 = sizes.iter().sum::<u64>().max(1);
     let mut per_file_counts = Vec::new();
-    for p in &paths {
-        let want = per_file.min(args.samples - gps.len());
+    for (i, p) in paths.iter().enumerate() {
+        // [2026-10-16] share ∝ record count (gp-threat-review: per-file equal sampling did not follow the training mix)
+        let share = if args.even { args.samples.div_ceil(paths.len()) }
+                    else { ((args.samples as u128 * sizes[i] as u128).div_ceil(total as u128)) as usize };
+        let want = share.min(args.samples - gps.len());
         let got = read_gp(p, args.offset, args.stride, want, &mut gps)?;
         eprintln!("{}: {got} positions", p.display());
         per_file_counts.push((p.display().to_string(), got));
