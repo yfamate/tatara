@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(gp5.arch_string(), GP5_ARCH);
         assert_eq!(parse_cyfamate_arch(GP5_ARCH).unwrap(), gp5);
         assert_eq!(parse_cyfamate_arch(GP5_H15_ARCH).unwrap().l1_out, 16);
-        // [MIRROR-HM] half-mirrored base: own feature token, 73,305 rows, "HM" hash tag; the
+        // Half-mirrored base rows: own feature token, 73,305 rows, "HM" hash tag; the
         // engine (cyf_gp8_threat.h kTagHm) expects the same top hash.
         let hm_base = CyfamateArch {
             ft_out: 1536,
@@ -1211,7 +1211,7 @@ mod tests {
         }
         cases.push((threat, 512, 16));
         cases.push((threat, 768, 16));
-        // [MIRROR-HM] half-mirrored base rows (73,305), with and without a raw-square threat block.
+        // Half-mirrored base rows (73,305), with and without a raw-square threat block.
         let hm = FeatureSet::HalfKaHmMerged.spec();
         cases.push((hm, 512, 16));
         cases.push((
